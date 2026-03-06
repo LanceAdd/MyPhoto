@@ -49,5 +49,8 @@ src-tauri/gen/schemas/
 # Agent skills lock file
 skills-lock.json
 
+# Design docs / planning notes (local only)
+docs/
+
 # OS
 Thumbs.db
