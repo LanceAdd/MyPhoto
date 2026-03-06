@@ -1,4 +1,4 @@
-<template>
+﻿<template>
   <div
     class="grid-view"
     ref="containerRef"
@@ -66,7 +66,7 @@
         <template #footer>
           <div style="display:flex;gap:8px;justify-content:flex-end">
             <n-button @click="showCopyDialog = false">取消</n-button>
-            <n-button type="primary" @click="doCopyPhotos">复制</n-button>
+            <n-button type="primary" @click="doCopyPhotos">确认</n-button>
           </div>
         </template>
       </n-card>
@@ -133,7 +133,7 @@ const contextMenuOptions = computed(() => [
   { type: 'divider', key: 'd0' },
   {
     label: '设置星级', key: 'star', children: [
-      { label: '☆ 清除', key: 'star_0' },
+      { label: '无星级', key: 'star_0' },
       { label: '★ 1星', key: 'star_1' },
       { label: '★★ 2星', key: 'star_2' },
       { label: '★★★ 3星', key: 'star_3' },
@@ -149,7 +149,7 @@ const contextMenuOptions = computed(() => [
       { label: '🟢 绿色', key: 'color_green' },
       { label: '🔵 蓝色', key: 'color_blue' },
       { label: '🟣 紫色', key: 'color_purple' },
-      { label: '清除标签', key: 'color_clear' },
+      { label: '无颜色', key: 'color_clear' },
     ]
   },
   { type: 'divider', key: 'd1' },
@@ -353,3 +353,5 @@ onUnmounted(() => resizeObserver?.disconnect())
 .empty p { font-size: 14px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 </style>
+
+

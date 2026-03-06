@@ -38,7 +38,9 @@ export interface Photo {
 export interface PhotoFilter {
   subfolder?: string
   star_min?: number
+  star_none?: boolean
   color_labels?: string[]
+  color_none?: boolean
   sort_by?: string
   sort_desc?: boolean
   include_missing?: boolean
@@ -98,12 +100,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     tabs.value.push(tab)
     activeTabIndex.value = tabs.value.length - 1
 
-    // Load subfolders
-    const subfolders: string[] = await invoke('get_subfolders', {
-      workspaceId: ws.id,
-      rootPath: path,
-    })
-    tab.subfolders = subfolders
+    await refreshSubfolders(tab)
   }
 
   async function closeTab(index: number) {
@@ -131,6 +128,33 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
     // Keep selection valid
     tab.selectedIds = new Set([...tab.selectedIds].filter(id => photos.some(p => p.id === id)))
+  }
+
+  function deriveSubfoldersFromPhotos(photos: Photo[]): string[] {
+    const folderSet = new Set<string>()
+    for (const photo of photos) {
+      const normalized = photo.relative_path.replace(/\\/g, '/')
+      const segments = normalized.split('/').filter(Boolean)
+      if (segments.length <= 1) continue
+      let current = ''
+      for (let i = 0; i < segments.length - 1; i++) {
+        current = current ? `${current}/${segments[i]}` : segments[i]
+        folderSet.add(current)
+      }
+    }
+    return [...folderSet].sort((a, b) => a.localeCompare(b))
+  }
+
+  async function refreshSubfolders(tab: WorkspaceTab) {
+    try {
+      const subfolders: string[] = await invoke('get_subfolders', {
+        workspaceId: tab.workspace.id,
+        rootPath: tab.workspace.path,
+      })
+      tab.subfolders = subfolders.length > 0 ? subfolders : deriveSubfoldersFromPhotos(tab.photos)
+    } catch {
+      tab.subfolders = deriveSubfoldersFromPhotos(tab.photos)
+    }
   }
 
   function setFilter(filter: Partial<PhotoFilter>) {
@@ -262,19 +286,20 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   // Listen for scan complete events
   async function setupListeners() {
-    await listen<{ workspace_id: number; count: number }>('scan-complete', (event) => {
+    await listen<{ workspace_id: number; count: number }>('scan-complete', async (event) => {
       const tab = tabs.value.find(t => t.workspace.id === event.payload.workspace_id)
       if (tab) {
         tab.scanning = false
         tab.workspace.photo_count = event.payload.count
-        loadPhotos(tabs.value.indexOf(tab))
+        await loadPhotos(tabs.value.indexOf(tab))
+        await refreshSubfolders(tab)
       }
     })
 
-    await listen<{ workspace_id: number; paths: string[] }>('file-created', (event) => {
+    await listen<{ workspace_id: number; paths: string[] }>('file-created', async (event) => {
       const tab = tabs.value.find(t => t.workspace.id === event.payload.workspace_id)
       if (tab) {
-        // Show notification - handled in component
+        await refreshSubfolders(tab)
       }
     })
 

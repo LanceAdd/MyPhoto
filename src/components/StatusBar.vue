@@ -28,7 +28,7 @@ const tab = computed(() => store.activeTab)
 const selectedCount = computed(() => tab.value?.selectedIds.size ?? 0)
 const hasFilter = computed(() => {
   const f = tab.value?.filter
-  return f && (f.star_min || f.color_labels?.length || f.subfolder)
+  return f && (f.star_min || f.star_none || f.color_labels?.length || f.color_none || f.subfolder)
 })
 const filteredCount = computed(() => tab.value?.photos.length ?? 0)
 const missingCount = computed(() => tab.value?.photos.filter(p => p.is_missing).length ?? 0)

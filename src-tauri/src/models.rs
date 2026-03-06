@@ -56,7 +56,9 @@ pub struct Keybinding {
 pub struct PhotoFilter {
     pub subfolder: Option<String>,
     pub star_min: Option<i64>,
+    pub star_none: Option<bool>,
     pub color_labels: Option<Vec<String>>,
+    pub color_none: Option<bool>,
     pub sort_by: Option<String>,   // "taken_at" | "filename" | "file_size" | "star_rating"
     pub sort_desc: Option<bool>,
     pub include_missing: Option<bool>,

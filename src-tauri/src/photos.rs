@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use chrono::Utc;
@@ -211,13 +212,15 @@ fn read_exif_data(path: &Path) -> (
 pub fn get_photos(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<Photo>, String> {
     with_db(|conn| {
         let mut conditions = vec!["p.workspace_id = ?1".to_string()];
-        let mut param_idx = 2;
+        let mut param_idx = 2usize;
 
         if let Some(ref _subfolder) = filter.subfolder {
             conditions.push(format!("p.relative_path LIKE ?{}", param_idx));
             param_idx += 1;
         }
-        if let Some(min) = filter.star_min {
+        if filter.star_none == Some(true) {
+            conditions.push("COALESCE(m.star_rating, 0) = 0".to_string());
+        } else if let Some(min) = filter.star_min {
             if min > 0 {
                 conditions.push(format!("COALESCE(m.star_rating, 0) >= ?{}", param_idx));
                 param_idx += 1;
@@ -228,9 +231,19 @@ pub fn get_photos(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<Photo>,
                 let placeholders: Vec<String> = (0..labels.len())
                     .map(|i| format!("?{}", param_idx + i))
                     .collect();
-                conditions.push(format!("m.color_label IN ({})", placeholders.join(",")));
-                let _ = param_idx;
+                if filter.color_none == Some(true) {
+                    conditions.push(format!(
+                        "(COALESCE(m.color_label, '') IN ({}) OR COALESCE(m.color_label, '') = '')",
+                        placeholders.join(",")
+                    ));
+                } else {
+                    conditions.push(format!("COALESCE(m.color_label, '') IN ({})", placeholders.join(",")));
+                }
+            } else if filter.color_none == Some(true) {
+                conditions.push("COALESCE(m.color_label, '') = ''".to_string());
             }
+        } else if filter.color_none == Some(true) {
+            conditions.push("COALESCE(m.color_label, '') = ''".to_string());
         }
         if filter.include_missing != Some(true) {
             conditions.push("p.is_missing = 0".to_string());
@@ -309,9 +322,11 @@ fn build_params(
     if let Some(s) = subfolder_like {
         params.push(Value::Text(s.to_string()));
     }
-    if let Some(min) = filter.star_min {
-        if min > 0 {
-            params.push(Value::Integer(min));
+    if filter.star_none != Some(true) {
+        if let Some(min) = filter.star_min {
+            if min > 0 {
+                params.push(Value::Integer(min));
+            }
         }
     }
     if let Some(ref labels) = filter.color_labels {
@@ -324,23 +339,37 @@ fn build_params(
 
 pub fn get_subfolders(_workspace_id: i64, root_path: &str) -> Result<Vec<String>, String> {
     let root = PathBuf::from(root_path);
-    let mut folders = vec![];
+    let mut folders: BTreeSet<String> = BTreeSet::new();
 
     for entry in WalkDir::new(&root)
-        .max_depth(10)
+        .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_dir() && e.depth() > 0)
+        .filter(|e| e.file_type().is_file() && is_image(e.path()))
     {
         let rel = entry.path()
             .strip_prefix(&root)
             .unwrap_or(entry.path())
             .to_string_lossy()
             .replace('\\', "/");
-        folders.push(rel);
+        let parts: Vec<&str> = rel
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.len() <= 1 {
+            continue;
+        }
+        let mut current = String::new();
+        for segment in &parts[..parts.len() - 1] {
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(segment);
+            folders.insert(current.clone());
+        }
     }
 
-    Ok(folders)
+    Ok(folders.into_iter().collect())
 }
 
 pub fn update_photo_meta(photo_id: i64, star_rating: i64, color_label: &str, notes: &str) -> Result<(), String> {
