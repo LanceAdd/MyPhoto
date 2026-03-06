@@ -49,23 +49,23 @@
 
     <n-modal v-model:show="showRename">
       <n-card :title="renameTitle" style="width: 360px">
-        <n-input v-model:value="renameValue" placeholder="Enter new name" @keyup.enter="doRename" />
+        <n-input v-model:value="renameValue" placeholder="请输入新名称" @keyup.enter="doRename" />
         <template #footer>
           <div style="display:flex;gap:8px;justify-content:flex-end">
-            <n-button @click="showRename = false">Cancel</n-button>
-            <n-button type="primary" @click="doRename">Confirm</n-button>
+            <n-button @click="showRename = false">取消</n-button>
+            <n-button type="primary" @click="doRename">确认</n-button>
           </div>
         </template>
       </n-card>
     </n-modal>
 
     <n-modal v-model:show="showNewFolder">
-      <n-card title="Create Folder" style="width: 360px">
-        <n-input v-model:value="newFolderName" placeholder="Folder name" @keyup.enter="doCreateFolder" />
+      <n-card title="新建文件夹" style="width: 360px">
+        <n-input v-model:value="newFolderName" placeholder="文件夹名称" @keyup.enter="doCreateFolder" />
         <template #footer>
           <div style="display:flex;gap:8px;justify-content:flex-end">
-            <n-button @click="showNewFolder = false">Cancel</n-button>
-            <n-button type="primary" @click="doCreateFolder">Create</n-button>
+            <n-button @click="showNewFolder = false">取消</n-button>
+            <n-button type="primary" @click="doCreateFolder">创建</n-button>
           </div>
         </template>
       </n-card>
@@ -106,7 +106,7 @@ const renameValue = ref('')
 const showNewFolder = ref(false)
 const newFolderName = ref('')
 
-const renameTitle = computed(() => ctxTargetType.value === 'file' ? 'Rename File' : 'Rename Folder')
+const renameTitle = computed(() => ctxTargetType.value === 'file' ? '重命名文件' : '重命名文件夹')
 
 function normalizePath(path: string) {
   return path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
@@ -247,43 +247,43 @@ function onTreeContextMenu(e: MouseEvent, path: string | null, kind: ContextTarg
 const contextMenuOptions = computed(() => {
   if (ctxTargetType.value === 'file') {
     return [
-      { label: 'Open File', key: 'open_file' },
-      { label: 'Reveal in Explorer', key: 'explorer' },
-      { label: 'Open Parent Folder', key: 'open_parent_folder' },
+      { label: '打开文件', key: 'open_file' },
+      { label: '在文件管理器中显示', key: 'explorer' },
+      { label: '打开上级文件夹', key: 'open_parent_folder' },
       { type: 'divider', key: 'd0' },
-      { label: 'Copy Absolute Path', key: 'copy_path' },
-      { label: 'Copy Relative Path', key: 'copy_relative_path' },
+      { label: '复制绝对路径', key: 'copy_path' },
+      { label: '复制相对路径', key: 'copy_relative_path' },
       { type: 'divider', key: 'd1' },
-      { label: 'Rename', key: 'rename' },
-      { label: 'Delete', key: 'delete' },
+      { label: '重命名', key: 'rename' },
+      { label: '删除', key: 'delete' },
     ]
   }
 
   if (ctxTargetType.value === 'folder') {
     return [
-      { label: 'Open Folder', key: 'open_folder' },
-      { label: 'Reveal in Explorer', key: 'explorer' },
+      { label: '打开文件夹', key: 'open_folder' },
+      { label: '在文件管理器中显示', key: 'explorer' },
       { type: 'divider', key: 'd0' },
-      { label: 'Copy Absolute Path', key: 'copy_path' },
-      { label: 'Copy Relative Path', key: 'copy_relative_path' },
+      { label: '复制绝对路径', key: 'copy_path' },
+      { label: '复制相对路径', key: 'copy_relative_path' },
       { type: 'divider', key: 'd1' },
-      { label: 'Rename', key: 'rename' },
-      { label: 'Create Subfolder', key: 'new_folder' },
-      { label: 'Delete Folder', key: 'delete' },
+      { label: '重命名', key: 'rename' },
+      { label: '新建子文件夹', key: 'new_folder' },
+      { label: '删除文件夹', key: 'delete' },
       { type: 'divider', key: 'd2' },
-      { label: 'Refresh Tree', key: 'refresh_tree' },
-      { label: 'Rescan Workspace', key: 'rescan_workspace' },
+      { label: '刷新文件树', key: 'refresh_tree' },
+      { label: '重新扫描工作区', key: 'rescan_workspace' },
     ]
   }
 
   return [
-    { label: 'Reveal in Explorer', key: 'explorer' },
+    { label: '在文件管理器中显示', key: 'explorer' },
     { type: 'divider', key: 'd0' },
-    { label: 'Copy Absolute Path', key: 'copy_path' },
-    { label: 'Create Folder', key: 'new_folder' },
+    { label: '复制绝对路径', key: 'copy_path' },
+    { label: '新建文件夹', key: 'new_folder' },
     { type: 'divider', key: 'd1' },
-    { label: 'Refresh Tree', key: 'refresh_tree' },
-    { label: 'Rescan Workspace', key: 'rescan_workspace' },
+    { label: '刷新文件树', key: 'refresh_tree' },
+    { label: '重新扫描工作区', key: 'rescan_workspace' },
   ]
 })
 
@@ -353,14 +353,14 @@ async function onContextMenuSelect(key: string) {
 
   if (key === 'copy_path') {
     await navigator.clipboard.writeText(absPath)
-    message.success('Absolute path copied')
+    message.success('已复制绝对路径')
     return
   }
 
   if (key === 'copy_relative_path') {
     const rel = ctxTargetPath.value ?? '.'
     await navigator.clipboard.writeText(rel)
-    message.success('Relative path copied')
+    message.success('已复制相对路径')
     return
   }
 
@@ -380,8 +380,8 @@ async function onContextMenuSelect(key: string) {
   if (key === 'delete') {
     if (ctxTargetType.value === 'root') return
     const targetLabel = pathName(ctxTargetPath.value ?? '')
-    const targetKind = ctxTargetType.value === 'folder' ? 'folder' : 'file'
-    const confirmed = window.confirm(`Delete ${targetKind} "${targetLabel}" permanently?`)
+    const targetKind = ctxTargetType.value === 'folder' ? '文件夹' : '文件'
+    const confirmed = window.confirm(`确认永久删除${targetKind}“${targetLabel}”？`)
     if (!confirmed) return
 
     await invoke('delete_entry', {
@@ -391,19 +391,19 @@ async function onContextMenuSelect(key: string) {
     await refreshTreeData()
     await requestRescan()
     await store.loadPhotos()
-    message.success(`${targetKind} deleted`)
+    message.success(`已删除${targetKind}`)
     return
   }
 
   if (key === 'refresh_tree') {
     await refreshTreeData()
-    message.success('Tree refreshed')
+    message.success('文件树已刷新')
     return
   }
 
   if (key === 'rescan_workspace') {
     await requestRescan()
-    message.success('Workspace rescan started')
+    message.success('已开始重新扫描工作区')
   }
 }
 
@@ -430,7 +430,7 @@ async function doRename() {
     activeFolder.value = nextRelPath
     activeFile.value = null
   }
-  message.success(`${ctxTargetType.value === 'file' ? 'File' : 'Folder'} renamed`)
+  message.success(`${ctxTargetType.value === 'file' ? '文件' : '文件夹'}已重命名`)
 }
 
 async function doCreateFolder() {
@@ -450,7 +450,7 @@ async function doCreateFolder() {
   await invoke('create_folder', { parentPath, name: newFolderName.value })
   showNewFolder.value = false
   await refreshTreeData()
-  message.success('Folder created')
+  message.success('文件夹已创建')
 }
 </script>
 
