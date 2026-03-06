@@ -70,6 +70,11 @@ async fn get_subfolders(workspace_id: i64, root_path: String) -> Result<Vec<Stri
 }
 
 #[tauri::command]
+async fn get_workspace_files(root_path: String) -> Result<Vec<WorkspaceFile>, String> {
+    photos::get_workspace_files(&root_path)
+}
+
+#[tauri::command]
 async fn get_thumbnail(photo_path: String, size: u32) -> Result<String, String> {
     let bytes = imaging::generate_thumbnail(&photo_path, size)?;
     Ok(STANDARD.encode(&bytes))
@@ -263,10 +268,37 @@ async fn rename_folder(path: String, new_name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn rename_entry(path: String, new_name: String) -> Result<String, String> {
+    let p = std::path::PathBuf::from(&path);
+    let parent = p.parent().ok_or("No parent directory")?;
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return Err("Name cannot be empty".to_string());
+    }
+    let new_path = parent.join(trimmed);
+    std::fs::rename(&p, &new_path).map_err(|e| e.to_string())?;
+    Ok(new_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 async fn create_folder(parent_path: String, name: String) -> Result<String, String> {
     let new_path = std::path::PathBuf::from(&parent_path).join(&name);
     std::fs::create_dir_all(&new_path).map_err(|e| e.to_string())?;
     Ok(new_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn delete_entry(path: String, is_dir: bool) -> Result<(), String> {
+    let p = std::path::PathBuf::from(&path);
+    if !p.exists() {
+        return Ok(());
+    }
+    if is_dir {
+        std::fs::remove_dir_all(&p).map_err(|e| e.to_string())?;
+    } else {
+        std::fs::remove_file(&p).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 // ─── Keybinding Commands ──────────────────────────────────────────────────────
@@ -354,6 +386,7 @@ pub fn run() {
             get_recent_workspaces,
             get_photos,
             get_subfolders,
+            get_workspace_files,
             get_thumbnail,
             update_photo_meta,
             batch_update_meta,
@@ -364,7 +397,9 @@ pub fn run() {
             copy_photos,
             move_photos,
             rename_folder,
+            rename_entry,
             create_folder,
+            delete_entry,
             get_keybindings,
             update_keybinding,
             save_workspace_settings,

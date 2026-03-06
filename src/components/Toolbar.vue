@@ -11,7 +11,7 @@
           :class="{ active: tab.viewMode === 'cull' }"
           @click="store.setViewMode('cull')"
           title="选片模式 (Tab)"
-        >◫ 选片</button>
+        >◼ 选片</button>
       </div>
 
       <div class="divider" />
@@ -28,8 +28,8 @@
 
       <div class="divider" />
 
-      <div class="filter-group">
-        <span class="filter-label">星级</span>
+      <div class="filter-group filter-section">
+        <span class="filter-label">星级筛选</span>
         <button
           class="star-filter-btn"
           :class="{ active: starFilter === 0 }"
@@ -48,7 +48,7 @@
           class="star-filter-btn"
           :class="{ active: starFilter === n }"
           @click="setStarFilter(n as 1 | 2 | 3 | 4 | 5)"
-          :title="`${n}星及以上`"
+          :title="`${n} 星及以上`"
         >{{ '★'.repeat(n) }}</button>
         <button
           class="icon-btn"
@@ -58,10 +58,10 @@
         >×</button>
       </div>
 
-      <div class="divider" />
+      <div class="divider divider-filter" />
 
-      <div class="filter-group">
-        <span class="filter-label">颜色</span>
+      <div class="filter-group filter-section">
+        <span class="filter-label">颜色筛选</span>
         <button
           class="none-filter-btn"
           :class="{ active: colorNone }"
@@ -268,7 +268,29 @@ async function rescan() {
 }
 .icon-btn:hover { border-color: #4F8EF7; color: #4F8EF7; }
 .filter-group { display: flex; align-items: center; gap: 4px; }
-.filter-label { font-size: 12px; color: #666; }
+.filter-section {
+  padding: 2px 6px;
+  border: 1px solid #2f2f2f;
+  border-radius: 7px;
+  background: #181818;
+}
+.filter-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: #b8c7dc;
+  letter-spacing: 0.03em;
+  background: #253a57;
+  border: 1px solid #355a85;
+  border-radius: 999px;
+  padding: 1px 7px;
+  margin-right: 2px;
+  white-space: nowrap;
+}
+.divider-filter {
+  margin: 0 10px;
+  height: 24px;
+  background: #3c3c3c;
+}
 .star-filter-btn {
   background: none;
   border: 1px solid #333;

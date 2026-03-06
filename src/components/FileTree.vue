@@ -1,36 +1,42 @@
 <template>
-  <div class="file-tree" @contextmenu.prevent="onTreeContextMenu($event, null)">
+  <div class="file-tree" @contextmenu.prevent="onTreeContextMenu($event, null, 'root')">
     <div class="tree-header">
       <span>{{ tab?.workspace.name }}</span>
     </div>
 
-    <!-- Root (All photos) -->
     <div
       class="tree-item"
-      :class="{ active: !activeFolder }"
+      :class="{ active: !activeFolder && !activeFile }"
       @click="selectFolder(null)"
-      @contextmenu.stop.prevent="onTreeContextMenu($event, null)"
+      @contextmenu.stop.prevent="onTreeContextMenu($event, null, 'root')"
     >
-      <span class="tree-icon">📁</span>
-      <span class="tree-name">全部照片</span>
-      <span class="tree-count">{{ tab?.photos.length }}</span>
+      <span class="tree-icon icon-root">🏠</span>
+      <span class="tree-name" title="全部照片">全部照片</span>
+      <span class="tree-count">{{ tab?.treeFiles.length ?? 0 }}</span>
     </div>
 
-    <!-- Subfolders -->
     <div
-      v-for="folder in tab?.subfolders"
-      :key="folder"
+      v-for="node in treeRows"
+      :key="`${node.kind}:${node.path}`"
       class="tree-item"
-      :class="{ active: activeFolder === folder }"
-      :style="{ paddingLeft: `${(folder.split('/').length) * 12 + 8}px` }"
-      @click="selectFolder(folder)"
-      @contextmenu.stop.prevent="onTreeContextMenu($event, folder)"
+      :class="{
+        active: (node.kind === 'folder' && activeFolder === node.path && !activeFile) ||
+          (node.kind === 'file' && activeFile === node.path),
+        'is-file': node.kind === 'file',
+      }"
+      :style="{ paddingLeft: `${node.depth * 12 + 8}px` }"
+      @click="node.kind === 'folder' ? selectFolder(node.path) : selectFile(node.path)"
+      @contextmenu.stop.prevent="onTreeContextMenu($event, node.path, node.kind)"
     >
-      <span class="tree-icon">📁</span>
-      <span class="tree-name">{{ folderName(folder) }}</span>
+      <span class="tree-icon" :class="node.kind === 'folder' ? 'icon-folder' : 'icon-file'">
+        {{ node.kind === 'folder' ? '📁' : '🖼️' }}
+      </span>
+      <span class="tree-name" :title="node.name">{{ shortenName(node.name, node.kind) }}</span>
+      <span v-if="node.kind === 'folder'" class="tree-count">
+        {{ folderFileCounts.get(node.path) ?? 0 }}
+      </span>
     </div>
 
-    <!-- Context Menu -->
     <n-dropdown
       trigger="manual"
       :x="ctxX"
@@ -41,27 +47,25 @@
       @select="onContextMenuSelect"
     />
 
-    <!-- Rename Modal -->
     <n-modal v-model:show="showRename">
-      <n-card title="重命名文件夹" style="width: 360px">
-        <n-input v-model:value="renameValue" placeholder="输入新名称" @keyup.enter="doRename" />
+      <n-card :title="renameTitle" style="width: 360px">
+        <n-input v-model:value="renameValue" placeholder="Enter new name" @keyup.enter="doRename" />
         <template #footer>
           <div style="display:flex;gap:8px;justify-content:flex-end">
-            <n-button @click="showRename = false">取消</n-button>
-            <n-button type="primary" @click="doRename">确认</n-button>
+            <n-button @click="showRename = false">Cancel</n-button>
+            <n-button type="primary" @click="doRename">Confirm</n-button>
           </div>
         </template>
       </n-card>
     </n-modal>
 
-    <!-- New Folder Modal -->
     <n-modal v-model:show="showNewFolder">
-      <n-card title="新建文件夹" style="width: 360px">
-        <n-input v-model:value="newFolderName" placeholder="文件夹名称" @keyup.enter="doCreateFolder" />
+      <n-card title="Create Folder" style="width: 360px">
+        <n-input v-model:value="newFolderName" placeholder="Folder name" @keyup.enter="doCreateFolder" />
         <template #footer>
           <div style="display:flex;gap:8px;justify-content:flex-end">
-            <n-button @click="showNewFolder = false">取消</n-button>
-            <n-button type="primary" @click="doCreateFolder">创建</n-button>
+            <n-button @click="showNewFolder = false">Cancel</n-button>
+            <n-button type="primary" @click="doCreateFolder">Create</n-button>
           </div>
         </template>
       </n-card>
@@ -73,116 +77,380 @@
 import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { NDropdown, NModal, NCard, NInput, NButton, useMessage } from 'naive-ui'
-import { useWorkspaceStore } from '../stores/workspace'
+import { useWorkspaceStore, type WorkspaceFile } from '../stores/workspace'
+
+type ContextTargetType = 'root' | 'folder' | 'file'
+
+interface FlatTreeNode {
+  kind: 'folder' | 'file'
+  path: string
+  name: string
+  depth: number
+}
 
 const store = useWorkspaceStore()
 const message = useMessage()
 const tab = computed(() => store.activeTab)
 
 const activeFolder = ref<string | null>(null)
+const activeFile = ref<string | null>(null)
+
 const ctxX = ref(0)
 const ctxY = ref(0)
 const showContextMenu = ref(false)
-const ctxTarget = ref<string | null>(null)
+const ctxTargetPath = ref<string | null>(null)
+const ctxTargetType = ref<ContextTargetType>('root')
 
 const showRename = ref(false)
 const renameValue = ref('')
 const showNewFolder = ref(false)
 const newFolderName = ref('')
 
-function folderName(path: string) {
-  return path.split('/').pop() ?? path
+const renameTitle = computed(() => ctxTargetType.value === 'file' ? 'Rename File' : 'Rename Folder')
+
+function normalizePath(path: string) {
+  return path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
 }
 
+function pathName(path: string) {
+  const p = normalizePath(path)
+  return p.split('/').pop() ?? p
+}
+
+function shortenName(name: string, kind: 'folder' | 'file') {
+  const max = kind === 'folder' ? 28 : 32
+  if (name.length <= max) return name
+  if (kind === 'folder') {
+    const head = name.slice(0, 14)
+    const tail = name.slice(-10)
+    return `${head}...${tail}`
+  }
+  const dot = name.lastIndexOf('.')
+  if (dot > 0 && dot < name.length - 1) {
+    const ext = name.slice(dot)
+    const base = name.slice(0, dot)
+    const keep = Math.max(8, max - ext.length - 3)
+    if (base.length <= keep) return name
+    return `${base.slice(0, keep)}...${ext}`
+  }
+  return `${name.slice(0, max - 3)}...`
+}
+
+function parentFolder(path: string) {
+  const p = normalizePath(path)
+  const idx = p.lastIndexOf('/')
+  return idx >= 0 ? p.slice(0, idx) : null
+}
+
+function toRelativePath(absPath: string, rootPath: string) {
+  const abs = normalizePath(absPath)
+  const root = normalizePath(rootPath)
+  if (abs === root) return ''
+  if (abs.startsWith(`${root}/`)) return abs.slice(root.length + 1)
+  return abs
+}
+
+function buildTreeRows(files: WorkspaceFile[]) {
+  const folderChildren = new Map<string, Set<string>>()
+  const filesByFolder = new Map<string, string[]>()
+  const folderCounts = new Map<string, number>()
+
+  for (const file of files) {
+    const rel = normalizePath(file.relative_path)
+    if (!rel) continue
+    const parts = rel.split('/').filter(Boolean)
+    if (parts.length === 0) continue
+
+    let parent = ''
+    for (let i = 0; i < parts.length - 1; i++) {
+      const current = parent ? `${parent}/${parts[i]}` : parts[i]
+      if (!folderChildren.has(parent)) folderChildren.set(parent, new Set())
+      folderChildren.get(parent)!.add(current)
+      folderCounts.set(current, (folderCounts.get(current) ?? 0) + 1)
+      parent = current
+    }
+
+    const folder = parts.length > 1 ? parts.slice(0, parts.length - 1).join('/') : ''
+    if (!filesByFolder.has(folder)) filesByFolder.set(folder, [])
+    filesByFolder.get(folder)!.push(rel)
+  }
+
+  const rows: FlatTreeNode[] = []
+  const walk = (folder: string, depth: number) => {
+    const childFolders = [...(folderChildren.get(folder) ?? new Set<string>())]
+      .sort((a, b) => pathName(a).localeCompare(pathName(b)))
+
+    for (const childFolder of childFolders) {
+      rows.push({
+        kind: 'folder',
+        path: childFolder,
+        name: pathName(childFolder),
+        depth,
+      })
+      walk(childFolder, depth + 1)
+    }
+
+    const childFiles = [...(filesByFolder.get(folder) ?? [])]
+      .sort((a, b) => pathName(a).localeCompare(pathName(b)))
+
+    for (const relFilePath of childFiles) {
+      rows.push({
+        kind: 'file',
+        path: relFilePath,
+        name: pathName(relFilePath),
+        depth,
+      })
+    }
+  }
+
+  walk('', 1)
+  return { rows, folderCounts }
+}
+
+const builtTree = computed(() => buildTreeRows(tab.value?.treeFiles ?? []))
+const treeRows = computed(() => builtTree.value.rows)
+const folderFileCounts = computed(() => builtTree.value.folderCounts)
+
 function selectFolder(folder: string | null) {
+  activeFolder.value = folder
+  activeFile.value = null
+  store.setFilter({ subfolder: folder ?? undefined })
+}
+
+function selectFile(filePath: string) {
+  activeFile.value = normalizePath(filePath)
+  const folder = parentFolder(filePath)
   activeFolder.value = folder
   store.setFilter({ subfolder: folder ?? undefined })
 }
 
-function onTreeContextMenu(e: MouseEvent, folder: string | null) {
+function onTreeContextMenu(e: MouseEvent, path: string | null, kind: ContextTargetType) {
+  if (kind === 'file' && path) {
+    activeFile.value = normalizePath(path)
+  }
+  if (kind === 'folder') {
+    activeFolder.value = path
+    activeFile.value = null
+  }
+  if (kind === 'root') {
+    activeFolder.value = null
+    activeFile.value = null
+  }
+
   ctxX.value = e.clientX
   ctxY.value = e.clientY
-  ctxTarget.value = folder
+  ctxTargetPath.value = path ? normalizePath(path) : null
+  ctxTargetType.value = kind
   showContextMenu.value = true
 }
 
 const contextMenuOptions = computed(() => {
-  const items = []
-  if (ctxTarget.value !== null) {
-    items.push(
-      { label: '在文件管理器中打开', key: 'explorer' },
-      { label: '复制路径', key: 'copy_path' },
+  if (ctxTargetType.value === 'file') {
+    return [
+      { label: 'Open File', key: 'open_file' },
+      { label: 'Reveal in Explorer', key: 'explorer' },
+      { label: 'Open Parent Folder', key: 'open_parent_folder' },
+      { type: 'divider', key: 'd0' },
+      { label: 'Copy Absolute Path', key: 'copy_path' },
+      { label: 'Copy Relative Path', key: 'copy_relative_path' },
       { type: 'divider', key: 'd1' },
-      { label: '重命名', key: 'rename' },
-    )
+      { label: 'Rename', key: 'rename' },
+      { label: 'Delete', key: 'delete' },
+    ]
   }
-  items.push(
-    { label: '新建文件夹', key: 'new_folder' },
-  )
-  if (ctxTarget.value !== null) {
-    items.push(
+
+  if (ctxTargetType.value === 'folder') {
+    return [
+      { label: 'Open Folder', key: 'open_folder' },
+      { label: 'Reveal in Explorer', key: 'explorer' },
+      { type: 'divider', key: 'd0' },
+      { label: 'Copy Absolute Path', key: 'copy_path' },
+      { label: 'Copy Relative Path', key: 'copy_relative_path' },
+      { type: 'divider', key: 'd1' },
+      { label: 'Rename', key: 'rename' },
+      { label: 'Create Subfolder', key: 'new_folder' },
+      { label: 'Delete Folder', key: 'delete' },
       { type: 'divider', key: 'd2' },
-      { label: '移入回收站', key: 'delete' },
-    )
+      { label: 'Refresh Tree', key: 'refresh_tree' },
+      { label: 'Rescan Workspace', key: 'rescan_workspace' },
+    ]
   }
-  return items
+
+  return [
+    { label: 'Reveal in Explorer', key: 'explorer' },
+    { type: 'divider', key: 'd0' },
+    { label: 'Copy Absolute Path', key: 'copy_path' },
+    { label: 'Create Folder', key: 'new_folder' },
+    { type: 'divider', key: 'd1' },
+    { label: 'Refresh Tree', key: 'refresh_tree' },
+    { label: 'Rescan Workspace', key: 'rescan_workspace' },
+  ]
 })
+
+function resolveContextAbsolutePath() {
+  const t = tab.value
+  if (!t) return null
+  const rel = ctxTargetPath.value
+  if (!rel) return t.workspace.path
+  return `${t.workspace.path}/${rel}`
+}
+
+async function refreshTreeData() {
+  const t = tab.value
+  if (!t) return
+
+  const [subfolders, files] = await Promise.all([
+    invoke<string[]>('get_subfolders', {
+      workspaceId: t.workspace.id,
+      rootPath: t.workspace.path,
+    }),
+    invoke<WorkspaceFile[]>('get_workspace_files', {
+      rootPath: t.workspace.path,
+    }),
+  ])
+
+  t.subfolders = subfolders
+  t.treeFiles = files
+}
+
+async function requestRescan() {
+  const t = tab.value
+  if (!t) return
+  await invoke('rescan_workspace', {
+    workspaceId: t.workspace.id,
+    workspacePath: t.workspace.path,
+  })
+}
 
 async function onContextMenuSelect(key: string) {
   showContextMenu.value = false
   const t = tab.value
   if (!t) return
 
-  const folderPath = ctxTarget.value
-    ? `${t.workspace.path}/${ctxTarget.value}`
-    : t.workspace.path
+  const absPath = resolveContextAbsolutePath()
+  if (!absPath) return
+
+  if (key === 'open_file') {
+    await invoke('open_with_default_app', { path: absPath })
+    return
+  }
+
+  if (key === 'open_folder') {
+    selectFolder(ctxTargetPath.value)
+    return
+  }
+
+  if (key === 'open_parent_folder') {
+    const parent = parentFolder(ctxTargetPath.value ?? '')
+    selectFolder(parent)
+    return
+  }
 
   if (key === 'explorer') {
-    await invoke('open_in_explorer', { path: folderPath })
-  } else if (key === 'copy_path') {
-    await navigator.clipboard.writeText(folderPath)
-    message.success('路径已复制')
-  } else if (key === 'rename') {
-    renameValue.value = folderName(ctxTarget.value ?? t.workspace.name)
+    await invoke('open_in_explorer', { path: absPath })
+    return
+  }
+
+  if (key === 'copy_path') {
+    await navigator.clipboard.writeText(absPath)
+    message.success('Absolute path copied')
+    return
+  }
+
+  if (key === 'copy_relative_path') {
+    const rel = ctxTargetPath.value ?? '.'
+    await navigator.clipboard.writeText(rel)
+    message.success('Relative path copied')
+    return
+  }
+
+  if (key === 'rename') {
+    if (ctxTargetType.value === 'root') return
+    renameValue.value = pathName(ctxTargetPath.value ?? '')
     showRename.value = true
-  } else if (key === 'new_folder') {
+    return
+  }
+
+  if (key === 'new_folder') {
     newFolderName.value = ''
     showNewFolder.value = true
-  } else if (key === 'delete') {
-    // Simple confirmation via message
-    message.warning('文件夹删除功能请在文件管理器中操作')
+    return
+  }
+
+  if (key === 'delete') {
+    if (ctxTargetType.value === 'root') return
+    const targetLabel = pathName(ctxTargetPath.value ?? '')
+    const targetKind = ctxTargetType.value === 'folder' ? 'folder' : 'file'
+    const confirmed = window.confirm(`Delete ${targetKind} "${targetLabel}" permanently?`)
+    if (!confirmed) return
+
+    await invoke('delete_entry', {
+      path: absPath,
+      isDir: ctxTargetType.value === 'folder',
+    })
+    await refreshTreeData()
+    await requestRescan()
+    await store.loadPhotos()
+    message.success(`${targetKind} deleted`)
+    return
+  }
+
+  if (key === 'refresh_tree') {
+    await refreshTreeData()
+    message.success('Tree refreshed')
+    return
+  }
+
+  if (key === 'rescan_workspace') {
+    await requestRescan()
+    message.success('Workspace rescan started')
   }
 }
 
 async function doRename() {
   const t = tab.value
-  if (!t || ctxTarget.value === null) return
-  const fullPath = `${t.workspace.path}/${ctxTarget.value}`
-  await invoke('rename_folder', { path: fullPath, newName: renameValue.value })
-  showRename.value = false
-  // Refresh subfolders
-  const subfolders: string[] = await invoke('get_subfolders', {
-    workspaceId: t.workspace.id,
-    rootPath: t.workspace.path,
+  if (!t || !ctxTargetPath.value || ctxTargetType.value === 'root') return
+
+  const oldFullPath = `${t.workspace.path}/${ctxTargetPath.value}`
+  const newAbsPath: string = await invoke('rename_entry', {
+    path: oldFullPath,
+    newName: renameValue.value,
   })
-  t.subfolders = subfolders
-  message.success('重命名成功')
+
+  showRename.value = false
+  await refreshTreeData()
+  await requestRescan()
+  await store.loadPhotos()
+
+  const nextRelPath = toRelativePath(newAbsPath, t.workspace.path)
+  if (ctxTargetType.value === 'file') {
+    activeFile.value = nextRelPath
+    activeFolder.value = parentFolder(nextRelPath)
+  } else {
+    activeFolder.value = nextRelPath
+    activeFile.value = null
+  }
+  message.success(`${ctxTargetType.value === 'file' ? 'File' : 'Folder'} renamed`)
 }
 
 async function doCreateFolder() {
   const t = tab.value
   if (!t) return
-  const parent = ctxTarget.value
-    ? `${t.workspace.path}/${ctxTarget.value}`
+
+  const targetFolder = ctxTargetType.value === 'folder'
+    ? ctxTargetPath.value
+    : ctxTargetType.value === 'file'
+      ? parentFolder(ctxTargetPath.value ?? '')
+      : null
+
+  const parentPath = targetFolder
+    ? `${t.workspace.path}/${targetFolder}`
     : t.workspace.path
-  await invoke('create_folder', { parentPath: parent, name: newFolderName.value })
+
+  await invoke('create_folder', { parentPath, name: newFolderName.value })
   showNewFolder.value = false
-  const subfolders: string[] = await invoke('get_subfolders', {
-    workspaceId: t.workspace.id,
-    rootPath: t.workspace.path,
-  })
-  t.subfolders = subfolders
-  message.success('文件夹已创建')
+  await refreshTreeData()
+  message.success('Folder created')
 }
 </script>
 
@@ -207,7 +475,7 @@ async function doCreateFolder() {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 8px 5px 8px;
+  padding: 5px 8px;
   cursor: pointer;
   font-size: 13px;
   color: #aaa;
@@ -217,8 +485,34 @@ async function doCreateFolder() {
 }
 .tree-item:hover { background: #2a2a2a; color: #ddd; }
 .tree-item.active { background: #1e3a5f; color: #4F8EF7; }
-.tree-icon { font-size: 13px; flex-shrink: 0; }
-.tree-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tree-count { font-size: 10px; color: #555; background: #2a2a2a; padding: 1px 5px; border-radius: 8px; }
+.tree-item.is-file .tree-icon { opacity: 0.85; }
+.tree-icon {
+  font-size: 14px;
+  line-height: 1;
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+}
+.icon-root { opacity: 1; }
+.icon-folder { opacity: 1; }
+.icon-file { opacity: 1; }
+.tree-item.active .icon-root,
+.tree-item.active .icon-folder,
+.tree-item.active .icon-file {
+  filter: saturate(1.08);
+}
+.tree-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tree-count {
+  font-size: 10px;
+  color: #555;
+  background: #2a2a2a;
+  padding: 1px 5px;
+  border-radius: 8px;
+}
 .tree-item.active .tree-count { background: #1a3050; color: #4F8EF7; }
 </style>

@@ -35,6 +35,11 @@ export interface Photo {
   notes: string
 }
 
+export interface WorkspaceFile {
+  relative_path: string
+  filename: string
+}
+
 export interface PhotoFilter {
   subfolder?: string
   star_min?: number
@@ -50,6 +55,7 @@ export interface WorkspaceTab {
   workspace: Workspace
   photos: Photo[]
   subfolders: string[]
+  treeFiles: WorkspaceFile[]
   filter: PhotoFilter
   selectedIds: Set<number>
   activePhotoId: number | null
@@ -86,6 +92,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       workspace: ws,
       photos: [],
       subfolders: [],
+      treeFiles: [],
       filter: settings.filter ?? {},
       selectedIds: new Set(),
       activePhotoId: null,
@@ -101,6 +108,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     activeTabIndex.value = tabs.value.length - 1
 
     await refreshSubfolders(tab)
+    await refreshTreeFiles(tab)
   }
 
   async function closeTab(index: number) {
@@ -154,6 +162,17 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       tab.subfolders = subfolders.length > 0 ? subfolders : deriveSubfoldersFromPhotos(tab.photos)
     } catch {
       tab.subfolders = deriveSubfoldersFromPhotos(tab.photos)
+    }
+  }
+
+  async function refreshTreeFiles(tab: WorkspaceTab) {
+    try {
+      const files: WorkspaceFile[] = await invoke('get_workspace_files', {
+        rootPath: tab.workspace.path,
+      })
+      tab.treeFiles = files
+    } catch {
+      tab.treeFiles = []
     }
   }
 
@@ -293,6 +312,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         tab.workspace.photo_count = event.payload.count
         await loadPhotos(tabs.value.indexOf(tab))
         await refreshSubfolders(tab)
+        await refreshTreeFiles(tab)
       }
     })
 
@@ -300,10 +320,11 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       const tab = tabs.value.find(t => t.workspace.id === event.payload.workspace_id)
       if (tab) {
         await refreshSubfolders(tab)
+        await refreshTreeFiles(tab)
       }
     })
 
-    await listen<{ workspace_id: number; paths: string[] }>('file-removed', (event) => {
+    await listen<{ workspace_id: number; paths: string[] }>('file-removed', async (event) => {
       const tab = tabs.value.find(t => t.workspace.id === event.payload.workspace_id)
       if (tab) {
         // Mark photos as missing
@@ -313,6 +334,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
             photo.is_missing = true
           }
         }
+        await refreshTreeFiles(tab)
       }
     })
   }

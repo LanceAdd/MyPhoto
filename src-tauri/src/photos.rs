@@ -5,7 +5,7 @@ use chrono::Utc;
 use rusqlite::params;
 
 use crate::db::with_db;
-use crate::models::{Photo, PhotoFilter, Workspace};
+use crate::models::{Photo, PhotoFilter, Workspace, WorkspaceFile};
 
 static IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "tiff", "tif",
@@ -370,6 +370,37 @@ pub fn get_subfolders(_workspace_id: i64, root_path: &str) -> Result<Vec<String>
     }
 
     Ok(folders.into_iter().collect())
+}
+
+pub fn get_workspace_files(root_path: &str) -> Result<Vec<WorkspaceFile>, String> {
+    let root = PathBuf::from(root_path);
+    let mut files: Vec<WorkspaceFile> = Vec::new();
+
+    for entry in WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file() && is_image(e.path()))
+    {
+        let rel = entry.path()
+            .strip_prefix(&root)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let filename = entry.path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        files.push(WorkspaceFile {
+            relative_path: rel,
+            filename,
+        });
+    }
+
+    files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(files)
 }
 
 pub fn update_photo_meta(photo_id: i64, star_rating: i64, color_label: &str, notes: &str) -> Result<(), String> {

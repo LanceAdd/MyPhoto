@@ -65,6 +65,12 @@ pub struct PhotoFilter {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceFile {
+    pub relative_path: String,
+    pub filename: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportOptions {
     pub photo_ids: Vec<i64>,
     pub dest_folder: String,
