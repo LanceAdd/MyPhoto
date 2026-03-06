@@ -1,17 +1,21 @@
 <template>
   <Teleport to="body">
     <div class="lightbox-overlay" @click.self="$emit('close')" @keydown="handleKey" tabindex="0" ref="boxRef">
-      <!-- Navigation -->
       <button class="lb-nav left" @click="navigate(-1)" :disabled="currentIndex <= 0">‹</button>
       <button class="lb-nav right" @click="navigate(1)" :disabled="currentIndex >= allPhotos.length - 1">›</button>
 
-      <!-- Close button -->
       <button class="lb-close" @click="$emit('close')">×</button>
+      <div class="lb-tools">
+        <button class="lb-tool-btn" @click="zoomBy(1 / 1.2)" title="Zoom out">-</button>
+        <button class="lb-tool-btn" @click="zoomBy(1.2)" title="Zoom in">+</button>
+        <button class="lb-tool-btn" @click="rotateBy(-90)" title="Rotate left">⟲</button>
+        <button class="lb-tool-btn" @click="rotateBy(90)" title="Rotate right">⟳</button>
+        <button class="lb-tool-btn" @click="resetTransform" title="Reset">1:1</button>
+        <span class="lb-tool-meta">{{ Math.round(scale * 100) }}% / {{ normalizedRotation }}°</span>
+      </div>
 
-      <!-- Image -->
       <div
         class="lb-img-wrap"
-        ref="imgWrapRef"
         @wheel.prevent="onWheel"
         @mousedown="startDrag"
         @mousemove="onDrag"
@@ -25,13 +29,12 @@
           :style="imgTransformStyle"
           draggable="false"
         />
-        <div v-else-if="currentPhoto?.is_missing" class="lb-missing">🚫 文件已丢失</div>
+        <div v-else-if="currentPhoto?.is_missing" class="lb-missing">文件已丢失</div>
         <div v-else class="lb-loading">
           <div class="spin">⟳</div>
         </div>
       </div>
 
-      <!-- HUD bottom -->
       <div class="lb-hud" v-if="currentPhoto">
         <div class="hud-info">
           <span class="hud-name">{{ currentPhoto.filename }}</span>
@@ -43,7 +46,6 @@
           <span v-if="currentPhoto.focal_length" class="hud-exif">{{ currentPhoto.focal_length }}mm</span>
         </div>
 
-        <!-- Quick mark -->
         <div class="hud-marks">
           <div class="hud-stars">
             <span
@@ -67,7 +69,6 @@
         </div>
       </div>
 
-      <!-- Counter -->
       <div class="lb-counter">{{ currentIndex + 1 }} / {{ allPhotos.length }}</div>
     </div>
   </Teleport>
@@ -83,24 +84,31 @@ const emit = defineEmits<{ close: [] }>()
 
 const store = useWorkspaceStore()
 const allPhotos = computed(() => store.activeTab?.photos ?? [])
-const currentIndex = ref(allPhotos.value.findIndex(p => p.id === props.photo.id))
+const currentIndex = ref(Math.max(0, allPhotos.value.findIndex(p => p.id === props.photo.id)))
 const currentPhoto = computed(() => allPhotos.value[currentIndex.value] ?? null)
 
 const boxRef = ref<HTMLElement>()
 const imgSrc = ref<string | null>(null)
 const scale = ref(1)
+const rotation = ref(0)
 const translateX = ref(0)
 const translateY = ref(0)
 
+const normalizedRotation = computed(() => {
+  const v = rotation.value % 360
+  return v >= 0 ? v : v + 360
+})
+
 const imgTransformStyle = computed(() => ({
-  transform: `translate(${translateX.value}px, ${translateY.value}px) scale(${scale.value})`,
+  transform: `translate(${translateX.value}px, ${translateY.value}px) scale(${scale.value}) rotate(${rotation.value}deg)`,
   cursor: scale.value > 1 ? 'grab' : 'default',
 }))
 
-// Drag state
 let dragging = false
-let dragStartX = 0, dragStartY = 0
-let dragOriginX = 0, dragOriginY = 0
+let dragStartX = 0
+let dragStartY = 0
+let dragOriginX = 0
+let dragOriginY = 0
 
 function startDrag(e: MouseEvent) {
   if (scale.value <= 1) return
@@ -117,16 +125,30 @@ function onDrag(e: MouseEvent) {
   translateY.value = dragOriginY + (e.clientY - dragStartY)
 }
 
-function stopDrag() { dragging = false }
-
-function onWheel(e: WheelEvent) {
-  const delta = e.deltaY > 0 ? 0.85 : 1.18
-  scale.value = Math.max(0.2, Math.min(10, scale.value * delta))
-  if (scale.value <= 1) { translateX.value = 0; translateY.value = 0 }
+function stopDrag() {
+  dragging = false
 }
 
-function resetZoom() {
+function zoomBy(multiplier: number) {
+  scale.value = Math.max(0.2, Math.min(10, scale.value * multiplier))
+  if (scale.value <= 1) {
+    translateX.value = 0
+    translateY.value = 0
+  }
+}
+
+function rotateBy(delta: number) {
+  rotation.value += delta
+}
+
+function onWheel(e: WheelEvent) {
+  const delta = e.deltaY > 0 ? (1 / 1.15) : 1.15
+  zoomBy(delta)
+}
+
+function resetTransform() {
   scale.value = 1
+  rotation.value = 0
   translateX.value = 0
   translateY.value = 0
 }
@@ -146,14 +168,19 @@ function formatDate(d: string | null) {
 
 async function loadImage() {
   const photo = currentPhoto.value
-  if (!photo || photo.is_missing) { imgSrc.value = null; return }
-  resetZoom()
+  if (!photo || photo.is_missing) {
+    imgSrc.value = null
+    return
+  }
+  resetTransform()
   imgSrc.value = null
   const fullPath = `${store.activeTab?.workspace.path}/${photo.relative_path}`
   try {
     const b64: string = await invoke('get_thumbnail', { photoPath: fullPath, size: 2400 })
     imgSrc.value = `data:image/jpeg;base64,${b64}`
-  } catch { imgSrc.value = null }
+  } catch {
+    imgSrc.value = null
+  }
 }
 
 watch(currentIndex, loadImage, { immediate: true })
@@ -169,10 +196,14 @@ function handleKey(e: KeyboardEvent) {
   if (e.key === 'ArrowLeft') { e.preventDefault(); navigate(-1) }
   else if (e.key === 'ArrowRight') { e.preventDefault(); navigate(1) }
   else if (e.key === 'Escape') emit('close')
-  else if (e.key === '+' || e.key === '=') { scale.value = Math.min(10, scale.value * 1.2) }
-  else if (e.key === '-') { scale.value = Math.max(0.2, scale.value / 1.2) }
-  else if (e.key === '0' && e.ctrlKey) { e.preventDefault(); resetZoom() }
-  else if (['1','2','3','4','5'].includes(e.key)) setStar(parseInt(e.key))
+  else if (e.key === '+' || e.key === '=') { e.preventDefault(); zoomBy(1.2) }
+  else if (e.key === '-') { e.preventDefault(); zoomBy(1 / 1.2) }
+  else if (e.key.toLowerCase() === 'r') {
+    e.preventDefault()
+    rotateBy(e.shiftKey ? -90 : 90)
+  }
+  else if (e.key === '0' && e.ctrlKey) { e.preventDefault(); resetTransform() }
+  else if (['1', '2', '3', '4', '5'].includes(e.key)) setStar(parseInt(e.key, 10))
   else if (e.key === '6') setColor('red')
   else if (e.key === '7') setColor('orange')
   else if (e.key === '8') setColor('yellow')
@@ -192,60 +223,131 @@ async function setColor(c: string) {
   await store.updateMeta(p.id, p.star_rating, c, p.notes)
 }
 
-onMounted(() => { nextTick(() => boxRef.value?.focus()) })
+onMounted(() => {
+  nextTick(() => boxRef.value?.focus())
+})
 </script>
 
 <style scoped>
 .lightbox-overlay {
-  position: fixed; inset: 0; z-index: 1000;
-  background: rgba(0,0,0,0.95);
-  display: flex; align-items: center; justify-content: center;
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.95);
+  display: flex;
+  align-items: center;
+  justify-content: center;
   outline: none;
 }
 .lb-nav {
-  position: absolute; top: 50%; transform: translateY(-50%);
-  background: rgba(255,255,255,0.1); border: none;
-  color: #fff; font-size: 48px; width: 60px; height: 80px;
-  cursor: pointer; z-index: 10; border-radius: 4px;
-  display: flex; align-items: center; justify-content: center;
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  background: rgba(255, 255, 255, 0.1);
+  border: none;
+  color: #fff;
+  font-size: 48px;
+  width: 60px;
+  height: 80px;
+  cursor: pointer;
+  z-index: 10;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   transition: background 0.15s;
 }
-.lb-nav:hover { background: rgba(255,255,255,0.2); }
+.lb-nav:hover { background: rgba(255, 255, 255, 0.2); }
 .lb-nav:disabled { opacity: 0.2; cursor: default; }
 .lb-nav.left { left: 12px; }
 .lb-nav.right { right: 12px; }
 
 .lb-close {
-  position: absolute; top: 12px; right: 16px;
-  background: rgba(255,255,255,0.1); border: none; color: #fff;
-  width: 36px; height: 36px; border-radius: 50%; font-size: 20px;
-  cursor: pointer; z-index: 10; display: flex; align-items: center; justify-content: center;
+  position: absolute;
+  top: 12px;
+  right: 16px;
+  background: rgba(255, 255, 255, 0.1);
+  border: none;
+  color: #fff;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  font-size: 20px;
+  cursor: pointer;
+  z-index: 11;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
-.lb-close:hover { background: rgba(255,255,255,0.25); }
+.lb-close:hover { background: rgba(255, 255, 255, 0.25); }
+
+.lb-tools {
+  position: absolute;
+  top: 12px;
+  right: 60px;
+  z-index: 11;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.lb-tool-btn {
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  color: #eee;
+  height: 30px;
+  min-width: 30px;
+  padding: 0 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.lb-tool-btn:hover {
+  border-color: #4F8EF7;
+  color: #4F8EF7;
+}
+.lb-tool-meta {
+  font-size: 12px;
+  color: #8ea3c3;
+  min-width: 84px;
+  text-align: right;
+}
 
 .lb-img-wrap {
-  width: 100vw; height: 100vh;
-  display: flex; align-items: center; justify-content: center;
-  overflow: hidden; position: relative;
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  position: relative;
 }
 .lb-img {
-  max-width: 100vw; max-height: 90vh;
+  max-width: 100vw;
+  max-height: 90vh;
   object-fit: contain;
   transition: transform 0.05s;
   user-select: none;
 }
 .lb-missing, .lb-loading {
-  color: #555; font-size: 48px;
-  display: flex; align-items: center; justify-content: center;
+  color: #555;
+  font-size: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .lb-hud {
-  position: absolute; bottom: 0; left: 0; right: 0;
-  background: linear-gradient(transparent, rgba(0,0,0,0.85));
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.85));
   padding: 20px 60px 12px;
-  display: flex; align-items: flex-end; justify-content: space-between;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
 }
 .hud-info { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .hud-name { font-size: 14px; color: #ddd; font-weight: 500; }
@@ -258,13 +360,19 @@ onMounted(() => { nextTick(() => boxRef.value?.focus()) })
 .hud-colors { display: flex; gap: 5px; align-items: center; }
 .hud-color { width: 18px; height: 18px; border-radius: 50%; cursor: pointer; border: 2px solid transparent; }
 .hud-color.active { border-color: #fff; }
-.hud-color:hover { border-color: rgba(255,255,255,0.6); }
+.hud-color:hover { border-color: rgba(255, 255, 255, 0.6); }
 .hud-clear { color: #888; cursor: pointer; font-size: 16px; }
 .hud-clear:hover { color: #ddd; }
 
 .lb-counter {
-  position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
-  font-size: 13px; color: #888; background: rgba(0,0,0,0.5);
-  padding: 4px 12px; border-radius: 12px;
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 13px;
+  color: #888;
+  background: rgba(0, 0, 0, 0.5);
+  padding: 4px 12px;
+  border-radius: 12px;
 }
 </style>

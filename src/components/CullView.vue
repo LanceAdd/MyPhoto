@@ -1,41 +1,45 @@
 <template>
   <div class="cull-view" @keydown="handleKey" tabindex="0" ref="cullRef">
-    <!-- Top toolbar -->
     <div class="cull-toolbar">
       <button class="back-btn" @click="store.setViewMode('grid')" title="返回网格模式 (Tab)">
         ← 返回网格
       </button>
       <span class="cull-info">{{ currentIndex + 1 }} / {{ photos.length }} 张</span>
       <div style="flex:1" />
+      <div class="preview-tools" title="缩放与旋转">
+        <button class="tool-btn" @click="zoomBy(1 / 1.2)" title="缩小">-</button>
+        <button class="tool-btn" @click="zoomBy(1.2)" title="放大">+</button>
+        <button class="tool-btn" @click="rotateBy(-90)" title="向左旋转">⟲</button>
+        <button class="tool-btn" @click="rotateBy(90)" title="向右旋转">⟳</button>
+        <button class="tool-btn" @click="resetTransform" title="重置">1:1</button>
+        <span class="tool-meta">{{ Math.round(scale * 100) }}% / {{ normalizedRotation }}°</span>
+      </div>
     </div>
 
-    <!-- Main area: big preview -->
     <div class="cull-main">
       <div class="cull-preview" v-if="currentPhoto">
-        <!-- Navigation arrows -->
         <button class="nav-arrow left" @click="navigate(-1)" :disabled="currentIndex <= 0">‹</button>
         <button class="nav-arrow right" @click="navigate(1)" :disabled="currentIndex >= photos.length - 1">›</button>
 
-        <!-- Big image -->
-        <div class="preview-img-wrap">
+        <div class="preview-img-wrap" @wheel.prevent="onPreviewWheel">
           <img
             v-if="currentPhoto && !currentPhoto.is_missing && previewSrc"
             :src="previewSrc"
             class="preview-img"
+            :style="previewTransformStyle"
+            draggable="false"
           />
-          <div v-else-if="currentPhoto?.is_missing" class="preview-missing">🚫 文件已丢失</div>
+          <div v-else-if="currentPhoto?.is_missing" class="preview-missing">文件已丢失</div>
           <div v-else class="preview-loading">
             <div class="loading-spin">⟳</div>
           </div>
         </div>
 
-        <!-- Info bar -->
         <div class="preview-info" v-if="currentPhoto">
           <span class="info-name">{{ currentPhoto.filename }}</span>
           <span class="info-sep">|</span>
           <span class="info-date">{{ formatDate(currentPhoto.taken_at) }}</span>
           <span class="info-sep">|</span>
-          <!-- Inline star setter -->
           <div class="inline-stars">
             <span
               v-for="n in 5"
@@ -46,7 +50,6 @@
             >★</span>
           </div>
           <span class="info-sep">|</span>
-          <!-- Inline color setter -->
           <div class="inline-colors">
             <span
               v-for="c in colorOptions"
@@ -72,7 +75,6 @@
       </div>
     </div>
 
-    <!-- Rail (horizontal thumbnail strip) -->
     <div class="cull-rail" ref="railRef" @wheel.prevent="onRailWheel">
       <div
         v-for="(photo, i) in photos"
@@ -83,9 +85,7 @@
         @click="goTo(i)"
       >
         <RailThumb :photo="photo" :workspace-path="tab?.workspace.path ?? ''" />
-        <!-- Star indicator -->
         <div v-if="photo.star_rating > 0" class="rail-star">{{ '★'.repeat(photo.star_rating) }}</div>
-        <!-- Color indicator -->
         <div
           v-if="photo.color_label"
           class="rail-color"
@@ -114,6 +114,18 @@ const currentPhoto = computed(() => photos.value[currentIndex.value] ?? null)
 const cullRef = ref<HTMLElement>()
 const railRef = ref<HTMLElement>()
 const previewSrc = ref<string | null>(null)
+const scale = ref(1)
+const rotation = ref(0)
+
+const normalizedRotation = computed(() => {
+  const v = rotation.value % 360
+  return v >= 0 ? v : v + 360
+})
+
+const previewTransformStyle = computed(() => ({
+  transform: `scale(${scale.value}) rotate(${rotation.value}deg)`,
+  transformOrigin: 'center center',
+}))
 
 const colorOptions = [
   { value: 'red', label: '红', hex: '#e74c3c' },
@@ -133,14 +145,38 @@ function formatDate(d: string | null) {
   return d.replace('T', ' ').slice(0, 16)
 }
 
+function zoomBy(multiplier: number) {
+  scale.value = Math.max(0.2, Math.min(10, scale.value * multiplier))
+}
+
+function rotateBy(delta: number) {
+  rotation.value += delta
+}
+
+function resetTransform() {
+  scale.value = 1
+  rotation.value = 0
+}
+
+function onPreviewWheel(e: WheelEvent) {
+  const delta = e.deltaY > 0 ? (1 / 1.12) : 1.12
+  zoomBy(delta)
+}
+
 async function loadPreview() {
   const photo = currentPhoto.value
-  if (!photo || photo.is_missing) { previewSrc.value = null; return }
+  if (!photo || photo.is_missing) {
+    previewSrc.value = null
+    return
+  }
+  resetTransform()
   const fullPath = `${tab.value?.workspace.path}/${photo.relative_path}`
   try {
     const b64: string = await invoke('get_thumbnail', { photoPath: fullPath, size: 1600 })
     previewSrc.value = `data:image/jpeg;base64,${b64}`
-  } catch { previewSrc.value = null }
+  } catch {
+    previewSrc.value = null
+  }
 }
 
 watch(currentIndex, loadPreview, { immediate: true })
@@ -181,7 +217,14 @@ function handleKey(e: KeyboardEvent) {
   if (e.key === 'ArrowLeft') { e.preventDefault(); navigate(-1) }
   else if (e.key === 'ArrowRight') { e.preventDefault(); navigate(1) }
   else if (e.key === 'Tab') { e.preventDefault(); store.setViewMode('grid') }
-  else if (['1','2','3','4','5'].includes(e.key)) setStar(parseInt(e.key))
+  else if (e.key === '+' || e.key === '=') { e.preventDefault(); zoomBy(1.2) }
+  else if (e.key === '-') { e.preventDefault(); zoomBy(1 / 1.2) }
+  else if (e.key.toLowerCase() === 'r') {
+    e.preventDefault()
+    rotateBy(e.shiftKey ? -90 : 90)
+  }
+  else if (e.key === '0' && e.ctrlKey) { e.preventDefault(); resetTransform() }
+  else if (['1', '2', '3', '4', '5'].includes(e.key)) setStar(parseInt(e.key, 10))
   else if (e.key === '6') setColor('red')
   else if (e.key === '7') setColor('orange')
   else if (e.key === '8') setColor('yellow')
@@ -199,7 +242,10 @@ function scrollRailToItem(el: HTMLElement) {
   })
 }
 
-onMounted(() => { cullRef.value?.focus(); loadPreview() })
+onMounted(() => {
+  cullRef.value?.focus()
+  loadPreview()
+})
 </script>
 
 <style scoped>
@@ -221,11 +267,39 @@ onMounted(() => { cullRef.value?.focus(); loadPreview() })
   flex-shrink: 0;
 }
 .back-btn {
-  background: none; border: 1px solid #333; color: #888;
-  padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 12px;
+  background: none;
+  border: 1px solid #333;
+  color: #888;
+  padding: 3px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
 }
 .back-btn:hover { border-color: #4F8EF7; color: #4F8EF7; }
 .cull-info { font-size: 13px; color: #666; }
+.preview-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.tool-btn {
+  background: none;
+  border: 1px solid #333;
+  color: #9a9a9a;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  min-width: 28px;
+  height: 24px;
+}
+.tool-btn:hover { border-color: #4F8EF7; color: #4F8EF7; }
+.tool-meta {
+  font-size: 11px;
+  color: #7789a3;
+  min-width: 72px;
+  text-align: right;
+}
 
 .cull-main {
   flex: 1;
@@ -244,7 +318,7 @@ onMounted(() => { cullRef.value?.focus(); loadPreview() })
   position: absolute;
   top: 50%;
   transform: translateY(-50%);
-  background: rgba(0,0,0,0.5);
+  background: rgba(0, 0, 0, 0.5);
   border: 1px solid #444;
   color: #fff;
   width: 40px;
@@ -258,7 +332,7 @@ onMounted(() => { cullRef.value?.focus(); loadPreview() })
   justify-content: center;
   transition: background 0.15s;
 }
-.nav-arrow:hover { background: rgba(0,0,0,0.8); }
+.nav-arrow:hover { background: rgba(0, 0, 0, 0.8); }
 .nav-arrow:disabled { opacity: 0.2; cursor: default; }
 .nav-arrow.left { left: 12px; }
 .nav-arrow.right { right: 12px; }
@@ -276,9 +350,11 @@ onMounted(() => { cullRef.value?.focus(); loadPreview() })
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
+  transition: transform 0.08s;
+  user-select: none;
 }
 .preview-missing {
-  font-size: 48px;
+  font-size: 36px;
   color: #555;
   display: flex;
   flex-direction: column;
@@ -288,8 +364,8 @@ onMounted(() => { cullRef.value?.focus(); loadPreview() })
 .preview-loading {
   font-size: 48px;
   color: #333;
-  animation: spin 1s linear infinite;
 }
+.loading-spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .preview-info {
@@ -297,7 +373,7 @@ onMounted(() => { cullRef.value?.focus(); loadPreview() })
   align-items: center;
   gap: 8px;
   padding: 6px 16px;
-  background: rgba(0,0,0,0.6);
+  background: rgba(0, 0, 0, 0.6);
   border-radius: 6px;
   margin-bottom: 6px;
   font-size: 13px;
@@ -311,7 +387,7 @@ onMounted(() => { cullRef.value?.focus(); loadPreview() })
 .inline-colors { display: flex; gap: 4px; align-items: center; }
 .inline-color { width: 14px; height: 14px; border-radius: 50%; cursor: pointer; border: 2px solid transparent; transition: border-color 0.1s; }
 .inline-color.active { border-color: #fff; }
-.inline-color:hover { border-color: rgba(255,255,255,0.6); }
+.inline-color:hover { border-color: rgba(255, 255, 255, 0.6); }
 .inline-clear { font-size: 14px; color: #666; cursor: pointer; }
 .inline-clear:hover { color: #ddd; }
 
@@ -346,17 +422,28 @@ onMounted(() => { cullRef.value?.focus(); loadPreview() })
 .rail-item:hover { border-color: #555; }
 .rail-item.active { border-color: #fff; }
 .rail-star {
-  position: absolute; bottom: 2px; right: 2px;
-  font-size: 8px; color: #f39c12; letter-spacing: -1px;
+  position: absolute;
+  bottom: 2px;
+  right: 2px;
+  font-size: 8px;
+  color: #f39c12;
+  letter-spacing: -1px;
   text-shadow: 0 1px 2px #000;
 }
 .rail-color {
-  position: absolute; top: 3px; left: 3px;
-  width: 8px; height: 8px; border-radius: 50%;
-  border: 1px solid rgba(0,0,0,0.4);
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.4);
 }
 .cull-empty {
-  display: flex; align-items: center; justify-content: center;
-  height: 100%; color: #555;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: #555;
 }
 </style>
