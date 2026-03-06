@@ -1,0 +1,53 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependencies
+node_modules
+
+# Build outputs
+dist
+dist-ssr
+
+# Environment / local config
+*.local
+.env
+.env.*
+!.env.example
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Python cache (from .codex skills)
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Codex agent skills (local tooling, not project source)
+.codex/
+
+# GitHub Copilot agent prompts (local tooling, mirrors .codex)
+.github/prompts/
+
+# Agent skills lock file
+skills-lock.json
+
+# OS
+Thumbs.db
