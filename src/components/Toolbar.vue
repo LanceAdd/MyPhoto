@@ -87,25 +87,41 @@
     </div>
 
     <div class="toolbar-right">
-      <button
-        v-if="tab.viewMode === 'grid'"
-        class="icon-btn"
-        @click="toggleGridLayout"
-        :title="tab.gridLayout === 'fit' ? '切换到流式布局' : '切换到方格布局'"
-      >{{ tab.gridLayout === 'fit' ? '▥' : '▦' }}</button>
+      <div class="view-toggle" v-if="tab.viewMode === 'grid'">
+        <button
+          :class="{ active: tab.gridLayout === 'fit' }"
+          @click="setGridLayout('fit')"
+          title="方格布局"
+        >▦ 方格</button>
+        <button
+          :class="{ active: tab.gridLayout === 'flow' }"
+          @click="setGridLayout('flow')"
+          title="流式布局"
+        >▤ 流式</button>
+      </div>
 
       <div class="size-slider" v-if="tab.viewMode === 'grid'">
-        <span style="font-size:10px">小</span>
+        <button
+          class="size-step-btn"
+          :disabled="thumbnailSize <= THUMB_MIN"
+          @click="changeThumbnailSize(-THUMB_STEP)"
+          title="缩小网格"
+        >-</button>
         <input
           type="range"
-          min="80"
-          max="300"
-          step="10"
-          :value="tab.thumbnailSize"
+          :min="THUMB_MIN"
+          :max="THUMB_MAX"
+          :step="THUMB_STEP"
+          :value="thumbnailSize"
           @input="onThumbnailSizeChange($event)"
-          style="width: 80px"
+          style="width: 90px"
         />
-        <span style="font-size:12px">大</span>
+        <button
+          class="size-step-btn"
+          :disabled="thumbnailSize >= THUMB_MAX"
+          @click="changeThumbnailSize(THUMB_STEP)"
+          title="放大网格"
+        >+</button>
       </div>
 
       <div class="divider" />
@@ -122,8 +138,14 @@ import { useWorkspaceStore } from '../stores/workspace'
 
 type StarFilterValue = 0 | 1 | 2 | 3 | 4 | 5 | 'none'
 
+const THUMB_MIN = 80
+const THUMB_MAX = 300
+const THUMB_STEP = 10
+
 const store = useWorkspaceStore()
 const tab = computed(() => store.activeTab!)
+
+const thumbnailSize = computed(() => tab.value?.thumbnailSize ?? THUMB_MIN)
 
 const sortBy = computed({
   get: () => tab.value?.filter.sort_by ?? 'taken_at',
@@ -154,6 +176,10 @@ const colorOptions = [
   { value: 'blue', label: '蓝色', hex: '#3498db' },
   { value: 'purple', label: '紫色', hex: '#9b59b6' },
 ]
+
+function clampThumb(value: number) {
+  return Math.max(THUMB_MIN, Math.min(THUMB_MAX, value))
+}
 
 function toggleSortDir() {
   store.setFilter({ sort_desc: !sortDesc.value })
@@ -200,14 +226,23 @@ function clearColorFilter() {
   applyColorFilter([], false)
 }
 
-function toggleGridLayout() {
+function setGridLayout(layout: 'fit' | 'flow') {
   const t = tab.value
-  if (t) t.gridLayout = t.gridLayout === 'fit' ? 'flow' : 'fit'
+  if (!t) return
+  t.gridLayout = layout
 }
 
 function onThumbnailSizeChange(e: Event) {
   const t = tab.value
-  if (t) t.thumbnailSize = parseInt((e.target as HTMLInputElement).value, 10)
+  if (!t) return
+  const raw = parseInt((e.target as HTMLInputElement).value, 10)
+  t.thumbnailSize = clampThumb(raw)
+}
+
+function changeThumbnailSize(delta: number) {
+  const t = tab.value
+  if (!t) return
+  t.thumbnailSize = clampThumb(t.thumbnailSize + delta)
 }
 
 async function rescan() {
@@ -326,6 +361,30 @@ async function rescan() {
 }
 .color-filter-btn.active { border-color: #fff; }
 .color-filter-btn:hover { border-color: rgba(255,255,255,0.6); }
-.size-slider { display: flex; align-items: center; gap: 4px; color: #666; }
+.size-slider {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #666;
+}
+.size-step-btn {
+  background: none;
+  border: 1px solid #333;
+  color: #888;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+.size-step-btn:hover:not(:disabled) {
+  border-color: #4F8EF7;
+  color: #4F8EF7;
+}
+.size-step-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
 input[type=range] { accent-color: #4F8EF7; }
 </style>
