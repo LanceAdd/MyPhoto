@@ -2,6 +2,7 @@ use crate::db::with_db;
 use crate::models::ExportOptions;
 use image::{imageops::FilterType, DynamicImage};
 use rusqlite::params;
+use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::BufWriter;
@@ -18,27 +19,11 @@ pub struct WarmupProgress {
     pub finished: bool,
 }
 
-pub fn generate_thumbnail(photo_path: &str, size: u32) -> Result<Vec<u8>, String> {
-    let cache_path = resolve_thumbnail_cache_path(photo_path, size);
-    if let Some(path) = cache_path.as_ref() {
-        if let Some(bytes) = try_read_cached_thumbnail(path) {
-            return Ok(bytes);
-        }
-    }
-
-    let img = image::open(photo_path).map_err(|e| e.to_string())?;
-    let thumb = img.thumbnail(size, size);
-    let mut buf = Vec::new();
-    let mut cursor = std::io::Cursor::new(&mut buf);
-    thumb
-        .write_to(&mut cursor, image::ImageFormat::Jpeg)
-        .map_err(|e| e.to_string())?;
-
-    if let Some(path) = cache_path.as_ref() {
-        write_cached_thumbnail(path, &buf);
-    }
-
-    Ok(buf)
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PreviewCacheInfo {
+    pub path: String,
+    pub size_bytes: u64,
+    pub profile_sizes: BTreeMap<String, u64>,
 }
 
 pub fn ensure_preview_cache_path(
@@ -70,6 +55,7 @@ pub fn ensure_preview_cache_path(
 }
 
 pub fn warmup_preview_cache_with_progress<F>(
+    workspace_id: i64,
     workspace_path: &str,
     size: u32,
     profile: &str,
@@ -92,8 +78,12 @@ where
         return Ok(0);
     }
 
-    let files = crate::photos::get_workspace_files(workspace_path)?;
-    let total = files.len().saturating_sub(offset).min(limit);
+    if workspace_id <= 0 {
+        return Err("invalid workspace id for warmup".to_string());
+    }
+
+    let files = crate::photos::get_workspace_files_page(workspace_id, offset, limit)?;
+    let total = files.len();
     on_progress(WarmupProgress {
         done: 0,
         total,
@@ -106,7 +96,7 @@ where
     }
 
     let mut warmed = 0usize;
-    for (idx, file) in files.into_iter().skip(offset).take(limit).enumerate() {
+    for (idx, file) in files.into_iter().enumerate() {
         let full = PathBuf::from(workspace_path).join(file.relative_path);
         if ensure_preview_cache_path(full.to_string_lossy().as_ref(), size, profile, quality)
             .is_ok()
@@ -123,21 +113,6 @@ where
         });
     }
     Ok(total)
-}
-
-fn resolve_thumbnail_cache_path(photo_path: &str, size: u32) -> Option<PathBuf> {
-    let root = thumbnail_cache_root()?;
-    let metadata = std::fs::metadata(photo_path).ok()?;
-    let file_len = metadata.len();
-    let modified_ns = metadata
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    let key = build_cache_key(photo_path, size, file_len, modified_ns);
-    let shard = &key[0..2];
-    Some(root.join(shard).join(format!("{key}.jpg")))
 }
 
 fn resolve_thumbnail_cache_path_v2(
@@ -186,15 +161,6 @@ fn write_cached_thumbnail(cache_path: &Path, bytes: &[u8]) {
         }
     }
     let _ = std::fs::write(cache_path, bytes);
-}
-
-fn build_cache_key(photo_path: &str, size: u32, file_len: u64, modified_ns: u128) -> String {
-    let mut hasher = DefaultHasher::new();
-    photo_path.hash(&mut hasher);
-    size.hash(&mut hasher);
-    file_len.hash(&mut hasher);
-    modified_ns.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
 }
 
 fn build_cache_key_v2(
@@ -280,6 +246,53 @@ pub fn rebuild_preview_cache() -> Result<usize, String> {
     std::fs::remove_dir_all(&root).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     Ok(removed)
+}
+
+pub fn get_preview_cache_info() -> Result<PreviewCacheInfo, String> {
+    let root = thumbnail_cache_root().ok_or_else(|| "cache root unavailable".to_string())?;
+    if !root.exists() {
+        std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    }
+
+    let profile_sizes = compute_profile_size_bytes(&root);
+    let size_bytes = profile_sizes
+        .values()
+        .copied()
+        .fold(0u64, |acc, v| acc.saturating_add(v));
+    Ok(PreviewCacheInfo {
+        path: root.to_string_lossy().to_string(),
+        size_bytes,
+        profile_sizes,
+    })
+}
+
+fn compute_profile_size_bytes(root: &Path) -> BTreeMap<String, u64> {
+    let mut profile_sizes = BTreeMap::<String, u64>::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let bytes = meta.len();
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        let depth = rel.components().count();
+        let key = if depth >= 3 {
+            rel.components()
+                .next()
+                .and_then(|c| c.as_os_str().to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "legacy".to_string())
+        } else {
+            "legacy".to_string()
+        };
+        let current = profile_sizes.get(&key).copied().unwrap_or(0);
+        profile_sizes.insert(key, current.saturating_add(bytes));
+    }
+    profile_sizes
 }
 
 pub fn export_photos(
@@ -432,33 +445,15 @@ fn save_image(img: &DynamicImage, path: &Path, format: &str, quality: u8) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::build_cache_key;
     use super::build_cache_key_v2;
     use super::ensure_preview_cache_path;
     use super::warmup_preview_cache_with_progress;
     use image::{ImageBuffer, Rgb};
+    use rusqlite::params;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn build_cache_key_is_stable_for_same_signature() {
-        let k1 = build_cache_key("C:/photos/a.jpg", 1600, 1234, 42);
-        let k2 = build_cache_key("C:/photos/a.jpg", 1600, 1234, 42);
-        assert_eq!(k1, k2);
-    }
-
-    #[test]
-    fn build_cache_key_changes_when_signature_changes() {
-        let base = build_cache_key("C:/photos/a.jpg", 1600, 1234, 42);
-        let by_size = build_cache_key("C:/photos/a.jpg", 1800, 1234, 42);
-        let by_len = build_cache_key("C:/photos/a.jpg", 1600, 9999, 42);
-        let by_mtime = build_cache_key("C:/photos/a.jpg", 1600, 1234, 43);
-
-        assert_ne!(base, by_size);
-        assert_ne!(base, by_len);
-        assert_ne!(base, by_mtime);
-    }
 
     #[test]
     fn cache_key_changes_when_profile_or_quality_changes() {
@@ -501,8 +496,10 @@ mod tests {
             cache_root.to_string_lossy().as_ref(),
         );
         let workspace = create_temp_workspace_with_images(3);
+        let workspace_id = prepare_workspace_for_warmup(&workspace);
 
         let warmed = warmup_preview_cache_with_progress(
+            workspace_id,
             workspace.to_string_lossy().as_ref(),
             1200,
             "preview",
@@ -518,6 +515,7 @@ mod tests {
         let generated = count_cached_jpegs(&cache_root);
         assert_eq!(generated, 2);
 
+        cleanup_workspace_from_db(workspace_id);
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(cache_root);
         std::env::remove_var("MYPHOTO_THUMB_CACHE_ROOT");
@@ -532,9 +530,11 @@ mod tests {
             cache_root.to_string_lossy().as_ref(),
         );
         let workspace = create_temp_workspace_with_images(2);
+        let workspace_id = prepare_workspace_for_warmup(&workspace);
 
         let mut steps: Vec<(usize, usize, bool)> = Vec::new();
         let warmed = warmup_preview_cache_with_progress(
+            workspace_id,
             workspace.to_string_lossy().as_ref(),
             1200,
             "preview",
@@ -552,8 +552,73 @@ mod tests {
         assert_eq!(steps.first().copied(), Some((0, 2, false)));
         assert_eq!(steps.last().copied(), Some((2, 2, true)));
 
+        cleanup_workspace_from_db(workspace_id);
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(cache_root);
+        std::env::remove_var("MYPHOTO_THUMB_CACHE_ROOT");
+    }
+
+    #[test]
+    #[ignore = "performance benchmark: run manually with --ignored --nocapture"]
+    fn warmup_benchmark_logs_batch_timings() {
+        let _guard = cache_env_lock().lock().expect("cache env lock");
+        let workspace = create_temp_workspace_with_images(800);
+        let workspace_id = prepare_workspace_for_warmup(&workspace);
+        let batch = 32usize;
+
+        let cache_root_paged = create_cache_root();
+        std::env::set_var(
+            "MYPHOTO_THUMB_CACHE_ROOT",
+            cache_root_paged.to_string_lossy().as_ref(),
+        );
+        let paged = run_warmup_benchmark_paged(
+            workspace_id,
+            workspace.to_string_lossy().as_ref(),
+            batch,
+            1200,
+            "preview",
+            82,
+        );
+
+        let cache_root_legacy = create_cache_root();
+        std::env::set_var(
+            "MYPHOTO_THUMB_CACHE_ROOT",
+            cache_root_legacy.to_string_lossy().as_ref(),
+        );
+        let legacy = run_warmup_benchmark_legacy(
+            workspace.to_string_lossy().as_ref(),
+            batch,
+            1200,
+            "preview",
+            82,
+        );
+
+        eprintln!(
+            "[warmup-bench] paged: processed={}, batches={}, total_ms={}, per_batch_ms={:?}",
+            paged.processed,
+            paged.batch_ms.len(),
+            paged.total_ms,
+            paged.batch_ms
+        );
+        eprintln!(
+            "[warmup-bench] legacy-sim: processed={}, batches={}, total_ms={}, per_batch_ms={:?}",
+            legacy.processed,
+            legacy.batch_ms.len(),
+            legacy.total_ms,
+            legacy.batch_ms
+        );
+        if paged.total_ms > 0 {
+            let ratio = (legacy.total_ms as f64) / (paged.total_ms as f64);
+            eprintln!("[warmup-bench] speedup(legacy/paged)={ratio:.2}x");
+        }
+
+        assert_eq!(paged.processed, legacy.processed);
+        assert_eq!(paged.processed, 800);
+
+        cleanup_workspace_from_db(workspace_id);
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(cache_root_paged);
+        let _ = std::fs::remove_dir_all(cache_root_legacy);
         std::env::remove_var("MYPHOTO_THUMB_CACHE_ROOT");
     }
 
@@ -604,6 +669,136 @@ mod tests {
         }
 
         root
+    }
+
+    struct WarmupBenchResult {
+        processed: usize,
+        total_ms: u128,
+        batch_ms: Vec<u128>,
+    }
+
+    fn run_warmup_benchmark_paged(
+        workspace_id: i64,
+        workspace_path: &str,
+        batch: usize,
+        size: u32,
+        profile: &str,
+        quality: u8,
+    ) -> WarmupBenchResult {
+        let mut offset = 0usize;
+        let mut processed = 0usize;
+        let mut batch_ms = Vec::new();
+        let started = Instant::now();
+
+        loop {
+            let t0 = Instant::now();
+            let done = warmup_preview_cache_with_progress(
+                workspace_id,
+                workspace_path,
+                size,
+                profile,
+                quality,
+                offset,
+                batch,
+                |_progress| {},
+            )
+            .expect("paged warmup run");
+            batch_ms.push(t0.elapsed().as_millis());
+            if done == 0 {
+                break;
+            }
+            processed += done;
+            offset += done;
+            if done < batch {
+                break;
+            }
+        }
+
+        WarmupBenchResult {
+            processed,
+            total_ms: started.elapsed().as_millis(),
+            batch_ms,
+        }
+    }
+
+    fn run_warmup_benchmark_legacy(
+        workspace_path: &str,
+        batch: usize,
+        size: u32,
+        profile: &str,
+        quality: u8,
+    ) -> WarmupBenchResult {
+        let mut offset = 0usize;
+        let mut processed = 0usize;
+        let mut batch_ms = Vec::new();
+        let started = Instant::now();
+
+        loop {
+            let t0 = Instant::now();
+            let files = crate::photos::get_workspace_files(workspace_path).expect("legacy file scan");
+            let take = files.len().saturating_sub(offset).min(batch);
+            if take == 0 {
+                batch_ms.push(t0.elapsed().as_millis());
+                break;
+            }
+            for file in files.into_iter().skip(offset).take(batch) {
+                let full = PathBuf::from(workspace_path).join(file.relative_path);
+                let _ = ensure_preview_cache_path(full.to_string_lossy().as_ref(), size, profile, quality);
+            }
+            batch_ms.push(t0.elapsed().as_millis());
+            processed += take;
+            offset += take;
+            if take < batch {
+                break;
+            }
+        }
+
+        WarmupBenchResult {
+            processed,
+            total_ms: started.elapsed().as_millis(),
+            batch_ms,
+        }
+    }
+
+    fn prepare_workspace_for_warmup(workspace: &Path) -> i64 {
+        let db_path = create_temp_db_path();
+        std::env::set_var("MYPHOTO_DB_PATH", db_path.to_string_lossy().as_ref());
+        crate::db::init_db().expect("init db");
+        let ws = crate::photos::open_or_create_workspace(workspace.to_string_lossy().as_ref())
+            .expect("open workspace");
+        crate::photos::scan_workspace_with_progress(
+            ws.id,
+            workspace.to_string_lossy().as_ref(),
+            |_progress| {},
+        )
+        .expect("scan workspace");
+        ws.id
+    }
+
+    fn cleanup_workspace_from_db(workspace_id: i64) {
+        let _ = crate::db::with_db(|conn| {
+            conn.execute(
+                "DELETE FROM photo_meta WHERE photo_id IN (SELECT id FROM photos WHERE workspace_id = ?1)",
+                params![workspace_id],
+            )?;
+            conn.execute("DELETE FROM photos WHERE workspace_id = ?1", params![workspace_id])?;
+            conn.execute("DELETE FROM workspaces WHERE id = ?1", params![workspace_id])?;
+            Ok(())
+        });
+        if let Ok(db_path) = std::env::var("MYPHOTO_DB_PATH") {
+            let _ = std::fs::remove_file(db_path);
+        }
+        std::env::remove_var("MYPHOTO_DB_PATH");
+    }
+
+    fn create_temp_db_path() -> PathBuf {
+        let mut path = std::env::current_dir().expect("current dir");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        path.push(format!("target/myphoto-test-db-{nanos}.sqlite3"));
+        path
     }
 
     fn count_cached_jpegs(root: &Path) -> usize {

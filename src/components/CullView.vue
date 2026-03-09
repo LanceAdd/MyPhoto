@@ -134,8 +134,6 @@ const translateY = ref(0)
 const PREVIEW_SIZE = 1600
 const PREVIEW_PROFILE = 'preview'
 const PREVIEW_QUALITY = 82
-const LEGACY_PREVIEW_SIZE = 1600
-const useCullV2 = readCullV2Flag()
 
 const normalizedRotation = computed(() => {
   const v = rotation.value % 360
@@ -191,12 +189,6 @@ function formatDate(d: string | null) {
   return d.replace('T', ' ').slice(0, 16)
 }
 
-function readCullV2Flag() {
-  const raw = localStorage.getItem('feature.lightbox_streaming_v2')
-  if (raw == null) return true
-  return raw !== 'false'
-}
-
 function fullPathOf(index: number) {
   const photo = photos.value[index]
   if (!photo) return null
@@ -212,19 +204,6 @@ function preloadImage(src: string) {
     img.onerror = () => resolve(false)
     img.src = src
   })
-}
-
-async function loadLegacyPreview(fullPath: string, seq: number) {
-  try {
-    const b64: string = await invoke('get_thumbnail', { photoPath: fullPath, size: LEGACY_PREVIEW_SIZE })
-    if (seq === loadSeq.value) {
-      previewSrc.value = `data:image/jpeg;base64,${b64}`
-    }
-  } catch {
-    if (seq === loadSeq.value) {
-      previewSrc.value = null
-    }
-  }
 }
 
 function zoomBy(multiplier: number) {
@@ -264,11 +243,6 @@ async function loadPreview() {
   const fullPath = fullPathOf(currentIndex.value)
   if (!fullPath) return
 
-  if (!useCullV2) {
-    await loadLegacyPreview(fullPath, seq)
-    return
-  }
-
   let showedPreview = false
   try {
     const cachedPath: string = await invoke('ensure_preview_cache', {
@@ -297,9 +271,7 @@ async function loadPreview() {
     return
   }
 
-  if (!showedPreview) {
-    await loadLegacyPreview(fullPath, seq)
-  }
+  if (!showedPreview) previewSrc.value = null
 }
 
 function prefetchNeighbors(center: number) {

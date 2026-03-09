@@ -5,7 +5,6 @@ mod photos;
 mod watcher;
 
 use crate::db::with_db;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use models::*;
 use rusqlite::params;
 use std::sync::Arc;
@@ -132,12 +131,6 @@ async fn get_workspace_files(root_path: String) -> Result<Vec<WorkspaceFile>, St
 }
 
 #[tauri::command]
-async fn get_thumbnail(photo_path: String, size: u32) -> Result<String, String> {
-    let bytes = imaging::generate_thumbnail(&photo_path, size)?;
-    Ok(STANDARD.encode(&bytes))
-}
-
-#[tauri::command]
 async fn ensure_preview_cache(
     photo_path: String,
     size: u32,
@@ -159,6 +152,7 @@ async fn warmup_previews(
     app: AppHandle,
 ) -> Result<usize, String> {
     imaging::warmup_preview_cache_with_progress(
+        workspace_id,
         &workspace_path,
         size,
         &profile,
@@ -184,6 +178,11 @@ async fn warmup_previews(
 #[tauri::command]
 async fn rebuild_preview_cache() -> Result<usize, String> {
     imaging::rebuild_preview_cache()
+}
+
+#[tauri::command]
+async fn get_preview_cache_info() -> Result<imaging::PreviewCacheInfo, String> {
+    imaging::get_preview_cache_info()
 }
 
 #[tauri::command]
@@ -554,10 +553,10 @@ pub fn run() {
             sync_removed_files,
             get_subfolders,
             get_workspace_files,
-            get_thumbnail,
             ensure_preview_cache,
             warmup_previews,
             rebuild_preview_cache,
+            get_preview_cache_info,
             update_photo_meta,
             batch_update_meta,
             export_photos,

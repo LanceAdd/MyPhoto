@@ -88,9 +88,15 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
 import { useWorkspaceStore } from '../stores/workspace'
 import MetaRow from './MetaRow.vue'
+import {
+  getExactCachedThumb,
+  getNearestCachedThumb,
+  normalizeThumbSize,
+  putCachedThumb,
+} from '../utils/thumb-cache'
+import { ensureGridThumbSrc } from '../utils/thumb-loader'
 
 const store = useWorkspaceStore()
 const tab = computed(() => store.activeTab)
@@ -100,6 +106,7 @@ const photo = computed(() => {
 })
 
 const thumbSrc = ref<string | null>(null)
+const loadSeq = ref(0)
 
 const colorOptions = [
   { value: 'red', label: '红', hex: '#e74c3c' },
@@ -130,13 +137,33 @@ function formatDate(d: string | null) {
 }
 
 async function loadThumb() {
+  const seq = ++loadSeq.value
   const p = photo.value
-  if (!p || p.is_missing) { thumbSrc.value = null; return }
+  if (!p || p.is_missing) {
+    if (seq === loadSeq.value) thumbSrc.value = null
+    return
+  }
   const fullPath = `${tab.value?.workspace.path}/${p.relative_path}`
+  const requestSize = normalizeThumbSize(480)
+  const nearest = getNearestCachedThumb(fullPath, requestSize)
+  if (nearest && seq === loadSeq.value && thumbSrc.value !== nearest) {
+    thumbSrc.value = nearest
+  }
+  const exact = getExactCachedThumb(fullPath, requestSize)
+  if (exact) {
+    if (seq === loadSeq.value) thumbSrc.value = exact
+    return
+  }
   try {
-    const b64: string = await invoke('get_thumbnail', { photoPath: fullPath, size: 480 })
-    thumbSrc.value = `data:image/jpeg;base64,${b64}`
-  } catch { thumbSrc.value = null }
+    const { size: normalizedSize, src } = await ensureGridThumbSrc(fullPath, requestSize)
+    if (seq !== loadSeq.value) return
+    thumbSrc.value = src
+    putCachedThumb(fullPath, normalizedSize, src)
+  } catch {
+    if (seq === loadSeq.value && !thumbSrc.value) {
+      thumbSrc.value = null
+    }
+  }
 }
 
 watch(() => photo.value?.id, loadThumb, { immediate: true })

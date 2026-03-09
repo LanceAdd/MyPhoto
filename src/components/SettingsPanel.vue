@@ -45,7 +45,39 @@
 
           <div class="section-title cache-title">缓存维护</div>
           <div class="notice">重建缓存会清空现有缩略图缓存，并按当前预热策略重新开始预热。</div>
+          <div class="cache-info">
+            <div class="cache-info-row">
+              <span>缓存目录</span>
+              <code
+                class="cache-path"
+                :class="{ clickable: !!cachePath }"
+                :title="cachePath || '无可用路径'"
+                @click="copyCachePath"
+              >{{ cachePath || '-' }}</code>
+            </div>
+            <div class="cache-info-row">
+              <span>占用大小</span>
+              <strong>{{ cacheInfoLoading ? '计算中...' : formatBytes(cacheSizeBytes) }}</strong>
+            </div>
+            <div class="cache-profiles">
+              <div class="cache-profiles-title">分组占用</div>
+              <div v-if="cacheProfileEntries.length === 0" class="cache-profile-row">
+                <span>-</span>
+                <strong>-</strong>
+              </div>
+              <div v-for="[name, size] in cacheProfileEntries" :key="name" class="cache-profile-row">
+                <span>{{ formatProfileName(name) }}</span>
+                <strong>{{ formatBytes(size) }}</strong>
+              </div>
+            </div>
+          </div>
           <div class="actions">
+            <button :disabled="cacheInfoLoading" @click="loadCacheInfo">
+              {{ cacheInfoLoading ? '刷新中...' : '刷新缓存信息' }}
+            </button>
+            <button :disabled="openingCacheFolder || !cachePath" @click="openCacheFolder">
+              {{ openingCacheFolder ? '打开中...' : '在文件管理器中打开缓存目录' }}
+            </button>
             <button :disabled="rebuildingCache" @click="rebuildCache">
               {{ rebuildingCache ? '重建中...' : '重建缩略图缓存' }}
             </button>
@@ -98,13 +130,19 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { getName, getTauriVersion, getVersion } from '@tauri-apps/api/app'
 import { useKeybindingStore, ACTION_LABELS, ACTION_GROUPS } from '../stores/keybinding'
 import { useWorkspaceStore } from '../stores/workspace'
 import { readWarmupSettings, saveWarmupSettings } from '../utils/warmup-settings'
 import { setGridRowAlignMode, useGridRowAlignMode, type GridRowAlignMode } from '../utils/grid-row-settings'
+
+interface PreviewCacheInfo {
+  path: string
+  size_bytes: number
+  profile_sizes?: Record<string, number>
+}
 
 const emit = defineEmits<{ close: [] }>()
 
@@ -113,12 +151,18 @@ const workspaceStore = useWorkspaceStore()
 const listeningAction = ref<string | null>(null)
 const activeSection = ref<'performance' | 'keybindings' | 'about'>('performance')
 
-const initialLimit = ref(200)
+const initialLimit = ref(40)
 const continueInBackground = ref(true)
 const gridRowAlignMode = ref<GridRowAlignMode>('center')
 const performanceMessage = ref('')
 const savingSettings = ref(false)
 const rebuildingCache = ref(false)
+const cacheInfoLoading = ref(false)
+const openingCacheFolder = ref(false)
+const cachePath = ref('')
+const cacheSizeBytes = ref<number | null>(null)
+const cacheProfileSizes = ref<Record<string, number>>({})
+const cacheProfileEntries = computed(() => Object.entries(cacheProfileSizes.value).sort((a, b) => b[1] - a[1]))
 
 const appName = ref('MyPhoto')
 const appVersion = ref('-')
@@ -130,6 +174,64 @@ function loadWarmupPrefs() {
   initialLimit.value = settings.initialLimit
   continueInBackground.value = settings.continueInBackground
   gridRowAlignMode.value = useGridRowAlignMode().value
+}
+
+function formatBytes(bytes: number | null) {
+  if (bytes == null || bytes < 0) return '-'
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes / 1024
+  let idx = 0
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024
+    idx += 1
+  }
+  return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[idx]}`
+}
+
+function formatProfileName(raw: string) {
+  if (!raw) return '未分类'
+  if (raw === 'legacy') return 'Legacy/未分组'
+  return raw
+}
+
+async function loadCacheInfo() {
+  cacheInfoLoading.value = true
+  try {
+    const info: PreviewCacheInfo = await invoke('get_preview_cache_info')
+    cachePath.value = info.path ?? ''
+    cacheSizeBytes.value = Number.isFinite(info.size_bytes) ? info.size_bytes : 0
+    cacheProfileSizes.value = info.profile_sizes ?? {}
+  } catch (e) {
+    cachePath.value = ''
+    cacheSizeBytes.value = null
+    cacheProfileSizes.value = {}
+    performanceMessage.value = `读取缓存信息失败：${String(e)}`
+  } finally {
+    cacheInfoLoading.value = false
+  }
+}
+
+async function openCacheFolder() {
+  if (!cachePath.value) return
+  openingCacheFolder.value = true
+  try {
+    await invoke('open_with_default_app', { path: cachePath.value })
+  } catch (e) {
+    performanceMessage.value = `打开缓存目录失败：${String(e)}`
+  } finally {
+    openingCacheFolder.value = false
+  }
+}
+
+async function copyCachePath() {
+  if (!cachePath.value) return
+  try {
+    await navigator.clipboard.writeText(cachePath.value)
+    performanceMessage.value = '缓存目录路径已复制。'
+  } catch (e) {
+    performanceMessage.value = `复制缓存目录失败：${String(e)}`
+  }
 }
 
 function getBinding(actionId: string) {
@@ -219,6 +321,7 @@ async function rebuildCache() {
     const removed: number = await invoke('rebuild_preview_cache')
     workspaceStore.restartWarmupForActiveWorkspace()
     performanceMessage.value = `缓存已重建，清理文件 ${removed} 个，已按当前策略重新开始预热。`
+    await loadCacheInfo()
   } catch (e) {
     performanceMessage.value = `重建缓存失败：${String(e)}`
   } finally {
@@ -228,6 +331,7 @@ async function rebuildCache() {
 
 onMounted(async () => {
   loadWarmupPrefs()
+  await loadCacheInfo()
   window.addEventListener('keydown', onKeyDown, true)
   appName.value = await getName().catch(() => 'MyPhoto')
   appVersion.value = await getVersion().catch(() => '-')
@@ -314,6 +418,74 @@ onUnmounted(() => {
   color: #7f8ea9;
 }
 .cache-title { margin-top: 8px; }
+.cache-info {
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: #1c1c1c;
+}
+.cache-info-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: #b2bccd;
+}
+.cache-info-row span {
+  color: #8894aa;
+  flex-shrink: 0;
+}
+.cache-info-row code {
+  color: #d4dbe8;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  background: #242424;
+  border: 1px solid #303030;
+  border-radius: 6px;
+  padding: 3px 6px;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cache-path.clickable {
+  cursor: pointer;
+}
+.cache-path.clickable:hover {
+  border-color: #4f8ef7;
+  background: #1f2f4b;
+}
+.cache-info-row strong { color: #d4dbe8; font-weight: 600; }
+.cache-profiles {
+  border-top: 1px dashed #2b2b2b;
+  padding-top: 6px;
+  margin-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.cache-profiles-title {
+  color: #7f8ea9;
+  font-size: 11px;
+}
+.cache-profile-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: #b2bccd;
+}
+.cache-profile-row span {
+  color: #8894aa;
+}
+.cache-profile-row strong {
+  color: #d4dbe8;
+  font-weight: 600;
+}
 .notice {
   color: #8c8c8c;
   font-size: 12px;

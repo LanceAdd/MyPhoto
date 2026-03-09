@@ -52,7 +52,6 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
 import { useWorkspaceStore, type Photo } from '../stores/workspace'
 import {
   getExactCachedThumb,
@@ -60,6 +59,7 @@ import {
   normalizeThumbSize,
   putCachedThumb,
 } from '../utils/thumb-cache'
+import { ensureGridThumbSrc } from '../utils/thumb-loader'
 
 const props = defineProps<{
   photo: Photo
@@ -118,10 +118,9 @@ async function loadThumb() {
   }
 
   try {
-    const b64: string = await invoke('get_thumbnail', { photoPath: fullPath, size: requestSize })
-    const src = `data:image/jpeg;base64,${b64}`
+    const { size: normalizedSize, src } = await ensureGridThumbSrc(fullPath, requestSize)
     thumbSrc.value = src
-    putCachedThumb(fullPath, requestSize, src)
+    putCachedThumb(fullPath, normalizedSize, src)
   } catch (e) {
     if (!thumbSrc.value) {
       thumbSrc.value = null

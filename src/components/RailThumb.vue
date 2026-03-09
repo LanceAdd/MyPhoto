@@ -8,22 +8,42 @@
 
 <script setup lang="ts">
 import { ref, onMounted, watch } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
 import type { Photo } from '../stores/workspace'
+import {
+  getExactCachedThumb,
+  getNearestCachedThumb,
+  normalizeThumbSize,
+  putCachedThumb,
+} from '../utils/thumb-cache'
+import { ensureGridThumbSrc } from '../utils/thumb-loader'
 
 const props = defineProps<{ photo: Photo; workspacePath: string }>()
 const thumbSrc = ref<string | null>(null)
 
 async function load() {
   if (props.photo.is_missing) return
+  const fullPath = `${props.workspacePath}/${props.photo.relative_path}`
+  const requestSize = normalizeThumbSize(160)
+  const nearest = getNearestCachedThumb(fullPath, requestSize)
+  if (nearest && thumbSrc.value !== nearest) {
+    thumbSrc.value = nearest
+  }
+  const exact = getExactCachedThumb(fullPath, requestSize)
+  if (exact) {
+    thumbSrc.value = exact
+    return
+  }
   try {
-    const fullPath = `${props.workspacePath}/${props.photo.relative_path}`
-    const b64: string = await invoke('get_thumbnail', { photoPath: fullPath, size: 160 })
-    thumbSrc.value = `data:image/jpeg;base64,${b64}`
+    const { size: normalizedSize, src } = await ensureGridThumbSrc(fullPath, requestSize)
+    thumbSrc.value = src
+    putCachedThumb(fullPath, normalizedSize, src)
   } catch { thumbSrc.value = null }
 }
-onMounted(load)
+onMounted(() => {
+  void load()
+})
 watch(() => props.photo.relative_path, load)
+watch(() => props.workspacePath, load)
 </script>
 
 <style scoped>

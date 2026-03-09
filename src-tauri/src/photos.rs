@@ -749,6 +749,40 @@ pub fn get_workspace_files(root_path: &str) -> Result<Vec<WorkspaceFile>, String
     Ok(files)
 }
 
+pub fn get_workspace_files_page(
+    workspace_id: i64,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<WorkspaceFile>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+    let offset_i64 = i64::try_from(offset).unwrap_or(i64::MAX);
+
+    with_db(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT relative_path, filename
+             FROM photos
+             WHERE workspace_id = ?1 AND is_missing = 0
+             ORDER BY relative_path ASC
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let list = stmt
+            .query_map(params![workspace_id, limit_i64, offset_i64], |r| {
+                Ok(WorkspaceFile {
+                    relative_path: r.get(0)?,
+                    filename: r.get(1)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(list)
+    })
+    .map_err(|e| e.to_string())
+}
+
 pub fn update_photo_meta(
     photo_id: i64,
     star_rating: i64,

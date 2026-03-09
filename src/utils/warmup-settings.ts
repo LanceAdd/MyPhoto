@@ -10,10 +10,10 @@ export const WARMUP_CONTINUE_KEY = 'warmup.continue'
 export const WARMUP_INITIAL_LIMIT_CUSTOMIZED_KEY = 'warmup.initial_limit.customized'
 
 export const DEFAULT_WARMUP_SETTINGS: WarmupSettings = {
-  initialLimit: 200,
+  initialLimit: 40,
   continueInBackground: true,
-  backgroundBatch: 32,
-  backgroundDelayMs: 900,
+  backgroundBatch: 16,
+  backgroundDelayMs: 1500,
 }
 
 function clampInt(value: number, min: number, max: number) {
@@ -30,7 +30,7 @@ export function readWarmupSettings(): WarmupSettings {
 
   // Migration logic:
   // - No customized flag + legacy non-zero value -> treat as user-customized.
-  // - No customized flag + zero/invalid value -> treat as default (200).
+  // - No customized flag + zero/invalid value -> treat as default (40).
   if (!hasCustomizedFlag && Number.isFinite(limitRaw) && limitRaw > 0) {
     localStorage.setItem(WARMUP_INITIAL_LIMIT_CUSTOMIZED_KEY, 'true')
   }

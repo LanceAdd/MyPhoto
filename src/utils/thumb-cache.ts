@@ -1,6 +1,6 @@
 const MAX_PHOTOS = 800
 const MAX_SIZES_PER_PHOTO = 4
-const SIZE_BUCKET = 32
+const SIZE_PRESETS = [160, 256, 384, 512]
 
 type SizeMap = Map<number, string>
 
@@ -33,7 +33,17 @@ function capPerPhoto(photoKey: string) {
 
 export function normalizeThumbSize(size: number): number {
   const normalized = Math.max(64, Math.round(size))
-  return Math.round(normalized / SIZE_BUCKET) * SIZE_BUCKET
+  let best = SIZE_PRESETS[0]
+  let bestDist = Math.abs(best - normalized)
+  for (let i = 1; i < SIZE_PRESETS.length; i++) {
+    const candidate = SIZE_PRESETS[i]
+    const dist = Math.abs(candidate - normalized)
+    if (dist < bestDist) {
+      best = candidate
+      bestDist = dist
+    }
+  }
+  return best
 }
 
 export function putCachedThumb(photoKey: string, size: number, src: string): void {

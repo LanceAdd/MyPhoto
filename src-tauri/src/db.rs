@@ -6,6 +6,17 @@ use std::sync::Mutex;
 static DB: Lazy<Mutex<Option<Connection>>> = Lazy::new(|| Mutex::new(None));
 
 pub fn get_db_path() -> PathBuf {
+    if let Ok(override_path) = std::env::var("MYPHOTO_DB_PATH") {
+        let trimmed = override_path.trim();
+        if !trimmed.is_empty() {
+            let path = PathBuf::from(trimmed);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            return path;
+        }
+    }
+
     let data_dir = dirs_next::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("myphoto");
@@ -73,6 +84,8 @@ fn create_tables(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_photos_workspace ON photos(workspace_id);
         CREATE INDEX IF NOT EXISTS idx_photos_missing ON photos(is_missing);
+        CREATE INDEX IF NOT EXISTS idx_photos_workspace_missing_rel
+          ON photos(workspace_id, is_missing, relative_path);
     ",
     )?;
 
