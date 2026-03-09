@@ -6,11 +6,11 @@
 
       <button class="lb-close" @click="$emit('close')">×</button>
       <div class="lb-tools">
-        <button class="lb-tool-btn" @click="zoomBy(1 / 1.2)" title="Zoom out">-</button>
-        <button class="lb-tool-btn" @click="zoomBy(1.2)" title="Zoom in">+</button>
-        <button class="lb-tool-btn" @click="rotateBy(-90)" title="Rotate left">⟲</button>
-        <button class="lb-tool-btn" @click="rotateBy(90)" title="Rotate right">⟳</button>
-        <button class="lb-tool-btn" @click="resetTransform" title="Reset">1:1</button>
+        <button class="lb-tool-btn" @click="zoomBy(1 / 1.2)" title="缩小">-</button>
+        <button class="lb-tool-btn" @click="zoomBy(1.2)" title="放大">+</button>
+        <button class="lb-tool-btn" @click="rotateBy(-90)" title="向左旋转">⟲</button>
+        <button class="lb-tool-btn" @click="rotateBy(90)" title="向右旋转">⟳</button>
+        <button class="lb-tool-btn" @click="resetTransform" title="重置">1:1</button>
         <span class="lb-tool-meta">{{ Math.round(scale * 100) }}% / {{ normalizedRotation }}°</span>
       </div>
 

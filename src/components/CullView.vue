@@ -2,11 +2,14 @@
   <div class="cull-view" @keydown="handleKey" tabindex="0" ref="cullRef">
     <div class="cull-toolbar">
       <button class="back-btn" @click="store.setViewMode('grid')" title="返回网格模式 (Tab)">
-        ← 返回网格
+        返回网格
       </button>
-      <span class="cull-info">{{ currentIndex + 1 }} / {{ photos.length }} 张</span>
-      <div style="flex:1" />
-      <div class="preview-tools" title="缩放与旋转">
+      <button class="back-btn" @click="restartFromBeginning" :disabled="photos.length === 0" title="从第一张重新选片">
+        重新开始
+      </button>
+      <span class="cull-info">{{ currentIndex + 1 }} / {{ photos.length }}</span>
+      <div style="flex: 1" />
+      <div class="preview-tools" title="预览缩放和旋转">
         <button class="tool-btn" @click="zoomBy(1 / 1.2)" title="缩小">-</button>
         <button class="tool-btn" @click="zoomBy(1.2)" title="放大">+</button>
         <button class="tool-btn" @click="rotateBy(-90)" title="向左旋转">⟲</button>
@@ -18,8 +21,8 @@
 
     <div class="cull-main">
       <div class="cull-preview" v-if="currentPhoto">
-        <button class="nav-arrow left" @click="navigate(-1)" :disabled="currentIndex <= 0">‹</button>
-        <button class="nav-arrow right" @click="navigate(1)" :disabled="currentIndex >= photos.length - 1">›</button>
+        <button class="nav-arrow left" @click="navigate(-1)" :disabled="currentIndex <= 0">&lt;</button>
+        <button class="nav-arrow right" @click="navigate(1)" :disabled="currentIndex >= photos.length - 1">&gt;</button>
 
         <div class="preview-img-wrap" @wheel.prevent="onPreviewWheel">
           <img
@@ -31,7 +34,7 @@
           />
           <div v-else-if="currentPhoto?.is_missing" class="preview-missing">文件已丢失</div>
           <div v-else class="preview-loading">
-            <div class="loading-spin">⟳</div>
+            <div class="loading-spin">加载中</div>
           </div>
         </div>
 
@@ -47,7 +50,7 @@
               class="inline-star"
               :class="{ filled: n <= currentPhoto.star_rating }"
               @click.stop="setStar(n)"
-            >★</span>
+            >*</span>
           </div>
           <span class="info-sep">|</span>
           <div class="inline-colors">
@@ -65,7 +68,7 @@
               class="inline-clear"
               @click.stop="setColor('')"
               title="清除标签"
-            >×</span>
+            >x</span>
           </div>
         </div>
       </div>
@@ -85,7 +88,7 @@
         @click="goTo(i)"
       >
         <RailThumb :photo="photo" :workspace-path="tab?.workspace.path ?? ''" />
-        <div v-if="photo.star_rating > 0" class="rail-star">{{ '★'.repeat(photo.star_rating) }}</div>
+        <div v-if="photo.star_rating > 0" class="rail-star">{{ '*'.repeat(photo.star_rating) }}</div>
         <div
           v-if="photo.color_label"
           class="rail-color"
@@ -300,6 +303,11 @@ function navigate(delta: number) {
 
 function goTo(i: number) {
   currentIndex.value = i
+}
+
+function restartFromBeginning() {
+  if (photos.value.length === 0) return
+  store.setCullIndex(0)
 }
 
 function setStar(n: number) {

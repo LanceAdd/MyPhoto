@@ -29,7 +29,7 @@
           <button
             class="pane-toggle"
             @click="toggleLeftPanel"
-            :title="leftPanelCollapsed ? 'Expand file tree' : 'Collapse file tree'"
+            :title="leftPanelCollapsed ? '展开文件树' : '收起文件树'"
           >{{ leftPanelCollapsed ? '>' : '<' }}</button>
         </div>
         <FileTree v-if="!leftPanelCollapsed" class="sidebar-left" />
@@ -61,7 +61,7 @@
           <button
             class="pane-toggle"
             @click="toggleRightPanel"
-            :title="rightPanelCollapsed ? 'Expand metadata panel' : 'Collapse metadata panel'"
+            :title="rightPanelCollapsed ? '展开元数据面板' : '收起元数据面板'"
           >{{ rightPanelCollapsed ? '<' : '>' }}</button>
         </div>
         <MetaPanel v-if="!rightPanelCollapsed" class="sidebar-right" />
@@ -120,7 +120,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, provide, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
@@ -150,6 +150,11 @@ const leftPanelWidth = ref(readNumber('layout.left.width', 260, LEFT_MIN, LEFT_M
 const rightPanelWidth = ref(readNumber('layout.right.width', 280, RIGHT_MIN, RIGHT_MAX))
 const leftPanelCollapsed = ref(readBool('layout.left.collapsed', false))
 const rightPanelCollapsed = ref(readBool('layout.right.collapsed', false))
+const skipCollapsePersistence = ref(false)
+const cullAutoCollapsed = ref(false)
+const cullPrevLeftCollapsed = ref(false)
+const cullPrevRightCollapsed = ref(false)
+const activeViewMode = computed(() => store.activeTab?.viewMode ?? 'grid')
 
 type ResizeSide = 'left' | 'right'
 const resizingSide = ref<ResizeSide | null>(null)
@@ -174,8 +179,28 @@ let notifIdCounter = 0
 
 watch(leftPanelWidth, (v) => writeStorage('layout.left.width', String(v)))
 watch(rightPanelWidth, (v) => writeStorage('layout.right.width', String(v)))
-watch(leftPanelCollapsed, (v) => writeStorage('layout.left.collapsed', String(v)))
-watch(rightPanelCollapsed, (v) => writeStorage('layout.right.collapsed', String(v)))
+watch(leftPanelCollapsed, (v) => {
+  if (!skipCollapsePersistence.value) writeStorage('layout.left.collapsed', String(v))
+})
+watch(rightPanelCollapsed, (v) => {
+  if (!skipCollapsePersistence.value) writeStorage('layout.right.collapsed', String(v))
+})
+watch(activeViewMode, (mode) => {
+  if (mode === 'cull') {
+    if (!cullAutoCollapsed.value) {
+      cullPrevLeftCollapsed.value = leftPanelCollapsed.value
+      cullPrevRightCollapsed.value = rightPanelCollapsed.value
+      cullAutoCollapsed.value = true
+    }
+    setCollapsedTemporarily(true, true)
+    return
+  }
+
+  if (cullAutoCollapsed.value) {
+    setCollapsedTemporarily(cullPrevLeftCollapsed.value, cullPrevRightCollapsed.value)
+    cullAutoCollapsed.value = false
+  }
+}, { immediate: true })
 
 function addNotification(msg: string, type: Notification['type'] = 'info', action?: Notification['action']) {
   const id = ++notifIdCounter
@@ -208,6 +233,15 @@ function readBool(key: string, fallback: boolean) {
 
 function writeStorage(key: string, value: string) {
   localStorage.setItem(key, value)
+}
+
+function setCollapsedTemporarily(left: boolean, right: boolean) {
+  skipCollapsePersistence.value = true
+  leftPanelCollapsed.value = left
+  rightPanelCollapsed.value = right
+  queueMicrotask(() => {
+    skipCollapsePersistence.value = false
+  })
 }
 
 function toggleLeftPanel() {
