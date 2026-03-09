@@ -15,7 +15,7 @@ impl WatcherManager {
     }
 
     pub fn watch_workspace(&self, workspace_id: i64, path: &str, app: AppHandle) {
-        let mut map: std::sync::MutexGuard<'_, HashMap<i64, notify::ReadDirectoryChangesWatcher>> =
+        let mut map: std::sync::MutexGuard<'_, HashMap<i64, RecommendedWatcher>> =
             self.watchers.lock().unwrap();
 
         let app_clone = app.clone();
