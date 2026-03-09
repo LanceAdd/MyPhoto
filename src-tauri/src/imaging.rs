@@ -76,6 +76,24 @@ fn build_cache_key(photo_path: &str, size: u32, file_len: u64, modified_ns: u128
     format!("{:016x}", hasher.finish())
 }
 
+fn build_cache_key_v2(
+    photo_path: &str,
+    size: u32,
+    file_len: u64,
+    modified_ns: u128,
+    profile: &str,
+    quality: u8,
+) -> String {
+    let mut hasher = DefaultHasher::new();
+    photo_path.hash(&mut hasher);
+    size.hash(&mut hasher);
+    file_len.hash(&mut hasher);
+    modified_ns.hash(&mut hasher);
+    profile.hash(&mut hasher);
+    quality.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 pub fn export_photos(
     workspace_path: &str,
     options: &ExportOptions,
@@ -221,6 +239,7 @@ fn save_image(img: &DynamicImage, path: &Path, format: &str, quality: u8) -> Res
 #[cfg(test)]
 mod tests {
     use super::build_cache_key;
+    use super::build_cache_key_v2;
 
     #[test]
     fn build_cache_key_is_stable_for_same_signature() {
@@ -239,5 +258,15 @@ mod tests {
         assert_ne!(base, by_size);
         assert_ne!(base, by_len);
         assert_ne!(base, by_mtime);
+    }
+
+    #[test]
+    fn cache_key_changes_when_profile_or_quality_changes() {
+        let base = build_cache_key_v2("C:/photos/a.jpg", 1800, 1234, 42, "preview", 82);
+        let by_profile = build_cache_key_v2("C:/photos/a.jpg", 1800, 1234, 42, "grid", 82);
+        let by_quality = build_cache_key_v2("C:/photos/a.jpg", 1800, 1234, 42, "preview", 90);
+
+        assert_ne!(base, by_profile);
+        assert_ne!(base, by_quality);
     }
 }
