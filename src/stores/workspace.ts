@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { readWarmupSettings } from '../utils/warmup-settings'
 
 export interface Workspace {
   id: number
@@ -71,7 +72,42 @@ export interface WorkspaceTab {
   thumbnailSize: number
   scrollTop: number
   scanning: boolean
+  scanPhase: string
+  scanDone: number
+  scanTotal: number | null
+  scanCurrent: string | null
+  scanError: string | null
+  warmupRunning: boolean
+  warmupDone: number
+  warmupTotal: number | null
+  warmupSucceeded: number
+  warmupCurrent: string | null
   cullIndex: number // current index in cull mode
+}
+
+interface ScanProgressPayload {
+  workspace_id: number
+  phase: string
+  done: number
+  total: number
+  current_path?: string | null
+}
+
+interface WarmupProgressPayload {
+  workspace_id: number
+  done: number
+  total: number
+  succeeded: number
+  current_file?: string | null
+  finished: boolean
+}
+
+const PREVIEW_WARMUP_SIZE = 1600
+const PREVIEW_WARMUP_PROFILE = 'preview'
+const PREVIEW_WARMUP_QUALITY = 82
+
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 export const useWorkspaceStore = defineStore('workspace', () => {
@@ -85,12 +121,103 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const pendingCreatedPathsByWorkspace = new Map<number, Set<string>>()
   const pendingRemovedPathsByWorkspace = new Map<number, Set<string>>()
   const fileEventFlushTimerByWorkspace = new Map<number, number>()
+  const warmupTokensByWorkspace = new Map<number, { cancelled: boolean }>()
 
   const activeTab = computed(() => tabs.value[activeTabIndex.value] ?? null)
   const activePhotos = computed(() => activeTab.value?.photos ?? [])
   const selectedPhotos = computed(() =>
     activePhotos.value.filter(p => activeTab.value?.selectedIds.has(p.id))
   )
+
+  function getTabByWorkspaceId(workspaceId: number) {
+    return tabs.value.find(t => t.workspace.id === workspaceId)
+  }
+
+  function stopWarmupPipeline(workspaceId: number) {
+    const token = warmupTokensByWorkspace.get(workspaceId)
+    if (token) token.cancelled = true
+    warmupTokensByWorkspace.delete(workspaceId)
+  }
+
+  async function runWarmupBatch(workspaceId: number, workspacePath: string, limit: number, offset: number) {
+    if (limit <= 0) return 0
+    const tab = getTabByWorkspaceId(workspaceId)
+    if (tab) {
+      tab.warmupRunning = true
+      tab.warmupDone = 0
+      tab.warmupTotal = limit
+      tab.warmupCurrent = null
+    }
+    try {
+      const processed: number = await invoke('warmup_previews', {
+        workspaceId,
+        workspacePath,
+        size: PREVIEW_WARMUP_SIZE,
+        profile: PREVIEW_WARMUP_PROFILE,
+        quality: PREVIEW_WARMUP_QUALITY,
+        offset,
+        limit,
+      })
+      return Math.max(0, processed ?? 0)
+    } catch {
+      return 0
+    }
+  }
+
+  async function startWarmupPipeline(workspaceId: number, workspacePath: string) {
+    stopWarmupPipeline(workspaceId)
+    const token = { cancelled: false }
+    warmupTokensByWorkspace.set(workspaceId, token)
+
+    const tab = getTabByWorkspaceId(workspaceId)
+    if (tab) {
+      tab.warmupRunning = true
+      tab.warmupDone = 0
+      tab.warmupTotal = null
+      tab.warmupCurrent = null
+    }
+
+    const settings = readWarmupSettings()
+    let offset = 0
+
+    if (settings.initialLimit > 0) {
+      const processed = await runWarmupBatch(workspaceId, workspacePath, settings.initialLimit, offset)
+      offset += processed
+      if (processed < settings.initialLimit) {
+        if (tab) tab.warmupRunning = false
+        warmupTokensByWorkspace.delete(workspaceId)
+        return
+      }
+    }
+
+    if (token.cancelled) return
+
+    if (!settings.continueInBackground) {
+      if (tab) tab.warmupRunning = false
+      warmupTokensByWorkspace.delete(workspaceId)
+      return
+    }
+
+    while (!token.cancelled) {
+      const latest = readWarmupSettings()
+      if (!latest.continueInBackground) break
+      const processed = await runWarmupBatch(workspaceId, workspacePath, latest.backgroundBatch, offset)
+      if (processed <= 0) break
+      offset += processed
+      if (processed < latest.backgroundBatch) break
+      const target = getTabByWorkspaceId(workspaceId)
+      if (target) target.warmupRunning = true
+      await sleep(latest.backgroundDelayMs)
+    }
+
+    if (!token.cancelled) {
+      const target = getTabByWorkspaceId(workspaceId)
+      if (target) {
+        target.warmupRunning = false
+      }
+    }
+    warmupTokensByWorkspace.delete(workspaceId)
+  }
 
   async function openWorkspace(path: string) {
     // Check if already open
@@ -116,19 +243,23 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       thumbnailSize: settings.thumbnailSize ?? 140,
       scrollTop: settings.scrollTop ?? 0,
       scanning: true,
+      scanPhase: 'scan_files',
+      scanDone: 0,
+      scanTotal: null,
+      scanCurrent: null,
+      scanError: null,
+      warmupRunning: true,
+      warmupDone: 0,
+      warmupTotal: null,
+      warmupSucceeded: 0,
+      warmupCurrent: null,
       cullIndex: 0,
     }
 
     tabs.value.push(tab)
     activeTabIndex.value = tabs.value.length - 1
 
-    void invoke('warmup_previews', {
-      workspacePath: ws.path,
-      size: 1600,
-      profile: 'preview',
-      quality: 82,
-      limit: 200,
-    }).catch(() => {})
+    void startWarmupPipeline(ws.id, ws.path)
 
     const tabIndex = activeTabIndex.value
     void loadPhotos(tabIndex, { refreshMeta: true })
@@ -149,6 +280,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       await invoke('close_workspace', { workspaceId: wsId })
       tabs.value.splice(index, 1)
       if (!tabs.value.some(t => t.workspace.id === wsId)) {
+        stopWarmupPipeline(wsId)
         metaCacheByWorkspace.delete(wsId)
         removedMetaCacheByWorkspace.delete(wsId)
         metaHydratedWorkspace.delete(wsId)
@@ -473,14 +605,14 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     const tab = activeTab.value
     if (!tab) return
     Object.assign(tab.filter, filter)
-    loadPhotos(undefined, { refreshMeta: false })
+    return loadPhotos(undefined, { refreshMeta: false })
   }
 
   function clearFilter() {
     const tab = activeTab.value
     if (!tab) return
     tab.filter = {}
-    loadPhotos(undefined, { refreshMeta: false })
+    return loadPhotos(undefined, { refreshMeta: false })
   }
 
   function selectPhoto(photoId: number, mode: 'single' | 'add' | 'range') {
@@ -567,9 +699,13 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     const tab = activeTab.value
     if (!tab) return
     tab.viewMode = mode
-    if (mode === 'cull' && tab.activePhotoId) {
-      const idx = tab.photos.findIndex(p => p.id === tab.activePhotoId)
-      tab.cullIndex = idx >= 0 ? idx : 0
+    if (mode === 'cull') {
+      const firstSelectedId = tab.selectedIds.values().next().value as number | undefined
+      const targetId = tab.activePhotoId ?? firstSelectedId ?? tab.photos[0]?.id ?? null
+      if (targetId != null) {
+        const idx = tab.photos.findIndex(p => p.id === targetId)
+        tab.cullIndex = idx >= 0 ? idx : 0
+      }
     }
   }
 
@@ -582,6 +718,12 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       tab.activePhotoId = tab.photos[clamped].id
       tab.selectedIds = new Set([tab.photos[clamped].id])
     }
+  }
+
+  function restartWarmupForActiveWorkspace() {
+    const tab = activeTab.value
+    if (!tab) return
+    void startWarmupPipeline(tab.workspace.id, tab.workspace.path)
   }
 
   async function saveTabSettings(tab: WorkspaceTab) {
@@ -600,16 +742,51 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   // Listen for scan complete events
   async function setupListeners() {
+    await listen<ScanProgressPayload>('scan-progress', async (event) => {
+      const tab = tabs.value.find(t => t.workspace.id === event.payload.workspace_id)
+      if (!tab) return
+      tab.scanning = true
+      tab.scanError = null
+      tab.scanPhase = event.payload.phase
+      tab.scanDone = Math.max(0, event.payload.done ?? 0)
+      tab.scanTotal = event.payload.total > 0 ? event.payload.total : null
+      tab.scanCurrent = event.payload.current_path ?? null
+    })
+
     await listen<{ workspace_id: number; count: number }>('scan-complete', async (event) => {
       const tab = tabs.value.find(t => t.workspace.id === event.payload.workspace_id)
       if (tab) {
         tab.scanning = false
+        tab.scanError = null
+        tab.scanPhase = 'done'
+        tab.scanDone = event.payload.count ?? tab.scanDone
+        tab.scanTotal = event.payload.count ?? tab.scanTotal
+        tab.scanCurrent = null
         tab.workspace.photo_count = event.payload.count
         await loadPhotos(tabs.value.indexOf(tab), { refreshMeta: true })
         await syncRemovedMetaCache(tab.workspace.id)
         await refreshSubfolders(tab)
         await refreshTreeFiles(tab)
       }
+    })
+
+    await listen<{ workspace_id: number; error: string }>('scan-error', async (event) => {
+      const tab = tabs.value.find(t => t.workspace.id === event.payload.workspace_id)
+      if (!tab) return
+      tab.scanning = false
+      tab.scanPhase = 'error'
+      tab.scanError = event.payload.error || 'scan failed'
+      tab.scanCurrent = null
+    })
+
+    await listen<WarmupProgressPayload>('warmup-progress', async (event) => {
+      const tab = tabs.value.find(t => t.workspace.id === event.payload.workspace_id)
+      if (!tab) return
+      tab.warmupDone = Math.max(0, event.payload.done ?? 0)
+      tab.warmupTotal = event.payload.total > 0 ? event.payload.total : null
+      tab.warmupSucceeded = Math.max(0, event.payload.succeeded ?? tab.warmupSucceeded)
+      tab.warmupCurrent = event.payload.current_file ?? null
+      tab.warmupRunning = event.payload.finished !== true
     })
 
     await listen<{ workspace_id: number; paths: string[] }>('file-created', async (event) => {
@@ -659,6 +836,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     updateSelectedMeta,
     setViewMode,
     setCullIndex,
+    restartWarmupForActiveWorkspace,
     saveTabSettings,
     setupListeners,
   }

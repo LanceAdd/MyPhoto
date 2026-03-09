@@ -54,6 +54,12 @@
 import { ref, computed, watch, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useWorkspaceStore, type Photo } from '../stores/workspace'
+import {
+  getExactCachedThumb,
+  getNearestCachedThumb,
+  normalizeThumbSize,
+  putCachedThumb,
+} from '../utils/thumb-cache'
 
 const props = defineProps<{
   photo: Photo
@@ -97,12 +103,29 @@ const imgStyle = computed(() => {
 
 async function loadThumb() {
   if (props.photo.is_missing) return
+  const fullPath = `${props.workspacePath}/${props.photo.relative_path}`
+  const requestSize = normalizeThumbSize(props.size * 2)
+
+  const nearest = getNearestCachedThumb(fullPath, requestSize)
+  if (nearest && thumbSrc.value !== nearest) {
+    thumbSrc.value = nearest
+  }
+
+  const exact = getExactCachedThumb(fullPath, requestSize)
+  if (exact) {
+    thumbSrc.value = exact
+    return
+  }
+
   try {
-    const fullPath = `${props.workspacePath}/${props.photo.relative_path}`
-    const b64: string = await invoke('get_thumbnail', { photoPath: fullPath, size: props.size * 2 })
-    thumbSrc.value = `data:image/jpeg;base64,${b64}`
+    const b64: string = await invoke('get_thumbnail', { photoPath: fullPath, size: requestSize })
+    const src = `data:image/jpeg;base64,${b64}`
+    thumbSrc.value = src
+    putCachedThumb(fullPath, requestSize, src)
   } catch (e) {
-    thumbSrc.value = null
+    if (!thumbSrc.value) {
+      thumbSrc.value = null
+    }
   }
 }
 
@@ -114,6 +137,12 @@ function setStar(n: number) {
 
 // Load thumbnail shortly after mount
 onMounted(() => {
+  const fullPath = `${props.workspacePath}/${props.photo.relative_path}`
+  const requestSize = normalizeThumbSize(props.size * 2)
+  const nearest = getNearestCachedThumb(fullPath, requestSize)
+  if (nearest) {
+    thumbSrc.value = nearest
+  }
   setTimeout(loadThumb, 50)
 })
 

@@ -59,7 +59,7 @@ pub struct PhotoFilter {
     pub star_none: Option<bool>,
     pub color_labels: Option<Vec<String>>,
     pub color_none: Option<bool>,
-    pub sort_by: Option<String>,   // "taken_at" | "filename" | "file_size" | "star_rating"
+    pub sort_by: Option<String>, // "taken_at" | "filename" | "file_size" | "star_rating"
     pub sort_desc: Option<bool>,
     pub include_missing: Option<bool>,
 }
@@ -74,11 +74,11 @@ pub struct WorkspaceFile {
 pub struct ExportOptions {
     pub photo_ids: Vec<i64>,
     pub dest_folder: String,
-    pub format: String,        // "original" | "jpeg" | "png" | "webp"
-    pub quality: u8,           // 0-100
+    pub format: String,             // "original" | "jpeg" | "png" | "webp"
+    pub quality: u8,                // 0-100
     pub max_dimension: Option<u32>, // long edge limit, None = original
-    pub naming_rule: String,   // "original" | "date_seq"
-    pub conflict: String,      // "skip" | "overwrite" | "rename"
+    pub naming_rule: String,        // "original" | "date_seq"
+    pub conflict: String,           // "skip" | "overwrite" | "rename"
 }
 
 #[allow(dead_code)]

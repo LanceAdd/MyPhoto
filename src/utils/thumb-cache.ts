@@ -1,0 +1,82 @@
+const MAX_PHOTOS = 800
+const MAX_SIZES_PER_PHOTO = 4
+const SIZE_BUCKET = 32
+
+type SizeMap = Map<number, string>
+
+const cacheByPhoto = new Map<string, SizeMap>()
+
+function touchPhoto(photoKey: string) {
+  const found = cacheByPhoto.get(photoKey)
+  if (!found) return
+  cacheByPhoto.delete(photoKey)
+  cacheByPhoto.set(photoKey, found)
+}
+
+function evictIfNeeded() {
+  while (cacheByPhoto.size > MAX_PHOTOS) {
+    const oldest = cacheByPhoto.keys().next().value as string | undefined
+    if (!oldest) break
+    cacheByPhoto.delete(oldest)
+  }
+}
+
+function capPerPhoto(photoKey: string) {
+  const sizes = cacheByPhoto.get(photoKey)
+  if (!sizes) return
+  while (sizes.size > MAX_SIZES_PER_PHOTO) {
+    const oldestSize = sizes.keys().next().value as number | undefined
+    if (oldestSize == null) break
+    sizes.delete(oldestSize)
+  }
+}
+
+export function normalizeThumbSize(size: number): number {
+  const normalized = Math.max(64, Math.round(size))
+  return Math.round(normalized / SIZE_BUCKET) * SIZE_BUCKET
+}
+
+export function putCachedThumb(photoKey: string, size: number, src: string): void {
+  const normalizedSize = normalizeThumbSize(size)
+  let sizes = cacheByPhoto.get(photoKey)
+  if (!sizes) {
+    sizes = new Map<number, string>()
+    cacheByPhoto.set(photoKey, sizes)
+  }
+  sizes.set(normalizedSize, src)
+  capPerPhoto(photoKey)
+  touchPhoto(photoKey)
+  evictIfNeeded()
+}
+
+export function getExactCachedThumb(photoKey: string, size: number): string | null {
+  const normalizedSize = normalizeThumbSize(size)
+  const sizes = cacheByPhoto.get(photoKey)
+  if (!sizes) return null
+  const src = sizes.get(normalizedSize) ?? null
+  if (src) {
+    touchPhoto(photoKey)
+  }
+  return src
+}
+
+export function getNearestCachedThumb(photoKey: string, size: number): string | null {
+  const normalizedSize = normalizeThumbSize(size)
+  const sizes = cacheByPhoto.get(photoKey)
+  if (!sizes || sizes.size === 0) return null
+
+  let bestSrc: string | null = null
+  let bestDist = Number.POSITIVE_INFINITY
+  for (const [s, src] of sizes.entries()) {
+    const dist = Math.abs(s - normalizedSize)
+    if (dist < bestDist) {
+      bestDist = dist
+      bestSrc = src
+      if (dist === 0) break
+    }
+  }
+  if (bestSrc) {
+    touchPhoto(photoKey)
+  }
+  return bestSrc
+}

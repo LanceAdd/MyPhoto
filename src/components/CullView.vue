@@ -24,7 +24,14 @@
         <button class="nav-arrow left" @click="navigate(-1)" :disabled="currentIndex <= 0">&lt;</button>
         <button class="nav-arrow right" @click="navigate(1)" :disabled="currentIndex >= photos.length - 1">&gt;</button>
 
-        <div class="preview-img-wrap" @wheel.prevent="onPreviewWheel">
+        <div
+          class="preview-img-wrap"
+          @wheel.prevent="onPreviewWheel"
+          @mousedown="startDrag"
+          @mousemove="onDrag"
+          @mouseup="stopDrag"
+          @mouseleave="stopDrag"
+        >
           <img
             v-if="currentPhoto && !currentPhoto.is_missing && previewSrc"
             :src="previewSrc"
@@ -121,6 +128,8 @@ const previewSrc = ref<string | null>(null)
 const loadSeq = ref(0)
 const scale = ref(1)
 const rotation = ref(0)
+const translateX = ref(0)
+const translateY = ref(0)
 
 const PREVIEW_SIZE = 1600
 const PREVIEW_PROFILE = 'preview'
@@ -134,9 +143,35 @@ const normalizedRotation = computed(() => {
 })
 
 const previewTransformStyle = computed(() => ({
-  transform: `scale(${scale.value}) rotate(${rotation.value}deg)`,
+  transform: `translate(${translateX.value}px, ${translateY.value}px) scale(${scale.value}) rotate(${rotation.value}deg)`,
   transformOrigin: 'center center',
+  cursor: scale.value > 1 ? 'grab' : 'default',
 }))
+
+let dragging = false
+let dragStartX = 0
+let dragStartY = 0
+let dragOriginX = 0
+let dragOriginY = 0
+
+function startDrag(e: MouseEvent) {
+  if (scale.value <= 1) return
+  dragging = true
+  dragStartX = e.clientX
+  dragStartY = e.clientY
+  dragOriginX = translateX.value
+  dragOriginY = translateY.value
+}
+
+function onDrag(e: MouseEvent) {
+  if (!dragging) return
+  translateX.value = dragOriginX + (e.clientX - dragStartX)
+  translateY.value = dragOriginY + (e.clientY - dragStartY)
+}
+
+function stopDrag() {
+  dragging = false
+}
 
 const colorOptions = [
   { value: 'red', label: '红', hex: '#e74c3c' },
@@ -194,6 +229,10 @@ async function loadLegacyPreview(fullPath: string, seq: number) {
 
 function zoomBy(multiplier: number) {
   scale.value = Math.max(0.2, Math.min(10, scale.value * multiplier))
+  if (scale.value <= 1) {
+    translateX.value = 0
+    translateY.value = 0
+  }
 }
 
 function rotateBy(delta: number) {
@@ -203,6 +242,8 @@ function rotateBy(delta: number) {
 function resetTransform() {
   scale.value = 1
   rotation.value = 0
+  translateX.value = 0
+  translateY.value = 0
 }
 
 function onPreviewWheel(e: WheelEvent) {

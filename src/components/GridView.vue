@@ -6,6 +6,22 @@
     @scroll="onScroll"
     tabindex="0"
   >
+    <div v-if="photos.length > 0" class="grid-actions">
+      <button
+        class="grid-action-btn"
+        :disabled="photos.length === 0"
+        @click="store.selectAll()"
+        title="全选当前筛选结果"
+      >全选</button>
+      <button
+        class="grid-action-btn"
+        :disabled="selectedCount === 0"
+        @click="store.clearSelection()"
+        title="取消当前选择"
+      >取消全选</button>
+      <span class="grid-selected-hint">已选 {{ selectedCount }}</span>
+    </div>
+
     <!-- Scanning indicator -->
     <div v-if="tab?.scanning" class="scanning-banner">
       <span class="spin">⟳</span> 正在扫描照片...
@@ -31,7 +47,7 @@
           v-for="row in visibleRows"
           :key="row[0]?.id"
           class="grid-row"
-          :style="{ height: cellSize + 'px', gap: gap + 'px', marginBottom: gap + 'px' }"
+          :style="rowStyle(row)"
         >
           <PhotoCard
             v-for="photo in row"
@@ -81,6 +97,7 @@ import { NDropdown, NModal, NCard, NInput, NButton, useMessage } from 'naive-ui'
 import { invoke } from '@tauri-apps/api/core'
 import { useWorkspaceStore, type Photo } from '../stores/workspace'
 import PhotoCard from './PhotoCard.vue'
+import { useGridRowAlignMode } from '../utils/grid-row-settings'
 
 const store = useWorkspaceStore()
 const message = useMessage()
@@ -89,6 +106,8 @@ const showExportFn = inject<() => void>('showExport')!
 
 const tab = computed(() => store.activeTab)
 const photos = computed(() => tab.value?.photos ?? [])
+const selectedCount = computed(() => tab.value?.selectedIds.size ?? 0)
+const gridRowAlignMode = useGridRowAlignMode()
 
 const containerRef = ref<HTMLElement>()
 const containerWidth = ref(800)
@@ -113,6 +132,42 @@ const startRow = computed(() => Math.max(0, Math.floor(scrollTop.value / rowHeig
 const endRow = computed(() => Math.min(rows.value.length, startRow.value + Math.ceil(viewportHeight.value / rowHeight.value) + 4))
 const visibleRows = computed(() => rows.value.slice(startRow.value, endRow.value))
 const offsetY = computed(() => startRow.value * rowHeight.value)
+
+function rowStyle(row: Photo[]) {
+  const style: Record<string, string> = {
+    height: `${cellSize.value}px`,
+    marginBottom: `${gap}px`,
+    gap: `${gap}px`,
+    justifyContent: 'center',
+  }
+  const isFullRow = row.length === cols.value
+
+  // Keep partial rows from being centered; in center mode align to the full-row
+  // first column start so visual column spacing stays consistent.
+  if (!isFullRow) {
+    style.justifyContent = 'flex-start'
+    if (gridRowAlignMode.value === 'center' && cols.value > 1) {
+      const fullRowWidth = cols.value * cellSize.value + (cols.value - 1) * gap
+      const leading = Math.max(0, (containerWidth.value - fullRowWidth) / 2)
+      style.paddingLeft = `${leading}px`
+    }
+    return style
+  }
+
+  if (gridRowAlignMode.value !== 'stretch') {
+    return style
+  }
+
+  if (row.length <= 1) {
+    return style
+  }
+
+  const available = Math.max(0, containerWidth.value - row.length * cellSize.value)
+  const stretchedGap = available / (row.length - 1)
+  style.justifyContent = 'flex-start'
+  style.gap = `${stretchedGap}px`
+  return style
+}
 
 function onScroll(e: Event) {
   scrollTop.value = (e.target as HTMLElement).scrollTop
@@ -340,6 +395,41 @@ onUnmounted(() => resizeObserver?.disconnect())
 .grid-container { position: relative; width: 100%; }
 .grid-offset { position: absolute; top: 0; left: 0; right: 0; }
 .grid-row { display: flex; }
+.grid-actions {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 4px 0;
+  background: linear-gradient(180deg, rgba(26, 26, 26, 0.96), rgba(26, 26, 26, 0.75), rgba(26, 26, 26, 0));
+}
+.grid-action-btn {
+  background: #202020;
+  border: 1px solid #343434;
+  color: #bbb;
+  border-radius: 5px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.grid-action-btn:hover:not(:disabled) {
+  border-color: #4f8ef7;
+  color: #4f8ef7;
+}
+.grid-action-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.grid-selected-hint {
+  font-size: 12px;
+  color: #7f90ad;
+  min-width: 54px;
+  text-align: right;
+}
 .scanning-banner {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 12px; background: #1e3a5f; border-radius: 4px;

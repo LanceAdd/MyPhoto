@@ -1,6 +1,6 @@
-use rusqlite::{Connection, Result, params};
-use std::path::PathBuf;
 use once_cell::sync::Lazy;
+use rusqlite::{params, Connection, Result};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 static DB: Lazy<Mutex<Option<Connection>>> = Lazy::new(|| Mutex::new(None));
@@ -23,7 +23,8 @@ pub fn init_db() -> Result<()> {
 }
 
 fn create_tables(conn: &Connection) -> Result<()> {
-    conn.execute_batch("
+    conn.execute_batch(
+        "
         CREATE TABLE IF NOT EXISTS workspaces (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             path TEXT NOT NULL UNIQUE,
@@ -72,14 +73,11 @@ fn create_tables(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_photos_workspace ON photos(workspace_id);
         CREATE INDEX IF NOT EXISTS idx_photos_missing ON photos(is_missing);
-    ")?;
+    ",
+    )?;
 
     // Insert default keybindings if empty
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM keybindings",
-        [],
-        |r| r.get(0),
-    )?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM keybindings", [], |r| r.get(0))?;
 
     if count == 0 {
         let defaults = vec![

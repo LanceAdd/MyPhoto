@@ -94,6 +94,7 @@ const tab = computed(() => store.activeTab)
 
 const activeFolder = ref<string | null>(null)
 const activeFile = ref<string | null>(null)
+const fileSelectToken = ref(0)
 
 const ctxX = ref(0)
 const ctxY = ref(0)
@@ -214,14 +215,27 @@ const folderFileCounts = computed(() => builtTree.value.folderCounts)
 function selectFolder(folder: string | null) {
   activeFolder.value = folder
   activeFile.value = null
+  fileSelectToken.value++
   store.setFilter({ subfolder: folder ?? undefined })
 }
 
-function selectFile(filePath: string) {
-  activeFile.value = normalizePath(filePath)
-  const folder = parentFolder(filePath)
+async function selectFile(filePath: string) {
+  const token = ++fileSelectToken.value
+  const normalizedFilePath = normalizePath(filePath)
+  activeFile.value = normalizedFilePath
+  const folder = parentFolder(normalizedFilePath)
   activeFolder.value = folder
-  store.setFilter({ subfolder: folder ?? undefined })
+
+  await store.setFilter({ subfolder: folder ?? undefined })
+
+  if (token !== fileSelectToken.value) return
+  const t = tab.value
+  if (!t) return
+
+  const photo = t.photos.find(p => normalizePath(p.relative_path) === normalizedFilePath)
+  if (photo) {
+    store.selectPhoto(photo.id, 'single')
+  }
 }
 
 function onTreeContextMenu(e: MouseEvent, path: string | null, kind: ContextTargetType) {

@@ -1,20 +1,23 @@
 <template>
   <div class="app-layout" @keydown="handleGlobalKey" tabindex="-1" ref="layoutRef">
     <div class="tab-bar">
-      <div
-        v-for="(tab, i) in store.tabs"
-        :key="tab.workspace.id"
-        class="tab"
-        :class="{ active: i === store.activeTabIndex }"
-        @click="store.activeTabIndex = i"
-      >
-        <span class="tab-icon">📁</span>
-        <span class="tab-name">{{ tab.workspace.name }}</span>
-        <span v-if="tab.scanning" class="tab-scanning">⟳</span>
-        <span class="tab-count" v-if="!tab.scanning">{{ tab.photos.length }}</span>
-        <button class="tab-close" @click.stop="store.closeTab(i)">×</button>
+      <div class="tab-strip">
+        <div
+          v-for="(tab, i) in store.tabs"
+          :key="tab.workspace.id"
+          class="tab"
+          :class="{ active: i === store.activeTabIndex }"
+          @click="store.activeTabIndex = i"
+        >
+          <span class="tab-icon">📁</span>
+          <span class="tab-name">{{ tab.workspace.name }}</span>
+          <span v-if="tab.scanning" class="tab-scanning">⟳</span>
+          <span class="tab-count" v-if="!tab.scanning">{{ tab.photos.length }}</span>
+          <button class="tab-close" @click.stop="store.closeTab(i)">×</button>
+        </div>
+        <button class="tab-add" @click="openFolder" title="打开文件夹 (Ctrl+O)">+ 新建工作区</button>
       </div>
-      <button class="tab-add" @click="openFolder" title="打开文件夹 (Ctrl+O)">+ 新建工作区</button>
+      <button class="tab-settings-btn" @click="showSettings = true" title="打开设置 (Ctrl+,)">⚙ 设置</button>
     </div>
 
     <Toolbar v-if="store.activeTab" />
@@ -335,15 +338,7 @@ onMounted(async () => {
     const tab = store.tabs.find(t => t.workspace.id === event.payload.workspace_id)
     if (tab) {
       const count = event.payload.paths.length
-      addNotification(`发现 ${count} 张新照片`, 'info', {
-        label: '立即添加',
-        fn: () => {
-          invoke('rescan_workspace', {
-            workspaceId: tab.workspace.id,
-            workspacePath: tab.workspace.path,
-          })
-        },
-      })
+      addNotification(`发现 ${count} 张新照片`, 'info')
     }
   })
 
@@ -374,10 +369,19 @@ onUnmounted(() => {
   height: 36px;
   background: #111;
   border-bottom: 1px solid #333;
-  overflow-x: auto;
+  overflow: hidden;
   flex-shrink: 0;
   gap: 2px;
-  padding: 0 4px;
+  padding: 0 6px 0 4px;
+}
+.tab-strip {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 .tab {
   display: flex;
@@ -426,6 +430,19 @@ onUnmounted(() => {
   margin-left: 4px;
 }
 .tab-add:hover { border-color: #4F8EF7; color: #4F8EF7; }
+.tab-settings-btn {
+  background: none;
+  border: 1px solid #3a3a3a;
+  color: #aaa;
+  border-radius: 6px;
+  height: 28px;
+  padding: 0 10px;
+  cursor: pointer;
+  margin-left: 8px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.tab-settings-btn:hover { color: #fff; border-color: #4f8ef7; }
 
 .main-area {
   display: flex;

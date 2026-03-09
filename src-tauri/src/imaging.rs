@@ -1,12 +1,22 @@
-use std::path::{Path, PathBuf};
-use std::io::BufWriter;
-use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
-use std::time::UNIX_EPOCH;
-use image::{DynamicImage, imageops::FilterType};
-use crate::models::ExportOptions;
 use crate::db::with_db;
+use crate::models::ExportOptions;
+use image::{imageops::FilterType, DynamicImage};
 use rusqlite::params;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+use walkdir::WalkDir;
+
+#[derive(Clone, Debug)]
+pub struct WarmupProgress {
+    pub done: usize,
+    pub total: usize,
+    pub succeeded: usize,
+    pub current_file: Option<String>,
+    pub finished: bool,
+}
 
 pub fn generate_thumbnail(photo_path: &str, size: u32) -> Result<Vec<u8>, String> {
     let cache_path = resolve_thumbnail_cache_path(photo_path, size);
@@ -20,7 +30,8 @@ pub fn generate_thumbnail(photo_path: &str, size: u32) -> Result<Vec<u8>, String
     let thumb = img.thumbnail(size, size);
     let mut buf = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut buf);
-    thumb.write_to(&mut cursor, image::ImageFormat::Jpeg)
+    thumb
+        .write_to(&mut cursor, image::ImageFormat::Jpeg)
         .map_err(|e| e.to_string())?;
 
     if let Some(path) = cache_path.as_ref() {
@@ -58,26 +69,60 @@ pub fn ensure_preview_cache_path(
     Ok(cache_path.to_string_lossy().to_string())
 }
 
-pub fn warmup_preview_cache(
+pub fn warmup_preview_cache_with_progress<F>(
     workspace_path: &str,
     size: u32,
     profile: &str,
     quality: u8,
+    offset: usize,
     limit: usize,
-) -> Result<usize, String> {
+    mut on_progress: F,
+) -> Result<usize, String>
+where
+    F: FnMut(WarmupProgress),
+{
     if limit == 0 {
+        on_progress(WarmupProgress {
+            done: 0,
+            total: 0,
+            succeeded: 0,
+            current_file: None,
+            finished: true,
+        });
         return Ok(0);
     }
 
     let files = crate::photos::get_workspace_files(workspace_path)?;
+    let total = files.len().saturating_sub(offset).min(limit);
+    on_progress(WarmupProgress {
+        done: 0,
+        total,
+        succeeded: 0,
+        current_file: None,
+        finished: total == 0,
+    });
+    if total == 0 {
+        return Ok(0);
+    }
+
     let mut warmed = 0usize;
-    for file in files.into_iter().take(limit) {
+    for (idx, file) in files.into_iter().skip(offset).take(limit).enumerate() {
         let full = PathBuf::from(workspace_path).join(file.relative_path);
-        if ensure_preview_cache_path(full.to_string_lossy().as_ref(), size, profile, quality).is_ok() {
+        if ensure_preview_cache_path(full.to_string_lossy().as_ref(), size, profile, quality)
+            .is_ok()
+        {
             warmed += 1;
         }
+        let done = idx + 1;
+        on_progress(WarmupProgress {
+            done,
+            total,
+            succeeded: warmed,
+            current_file: Some(file.filename),
+            finished: done >= total,
+        });
     }
-    Ok(warmed)
+    Ok(total)
 }
 
 fn resolve_thumbnail_cache_path(photo_path: &str, size: u32) -> Option<PathBuf> {
@@ -95,7 +140,12 @@ fn resolve_thumbnail_cache_path(photo_path: &str, size: u32) -> Option<PathBuf> 
     Some(root.join(shard).join(format!("{key}.jpg")))
 }
 
-fn resolve_thumbnail_cache_path_v2(photo_path: &str, size: u32, profile: &str, quality: u8) -> Option<PathBuf> {
+fn resolve_thumbnail_cache_path_v2(
+    photo_path: &str,
+    size: u32,
+    profile: &str,
+    quality: u8,
+) -> Option<PathBuf> {
     let root = thumbnail_cache_root()?;
     let metadata = std::fs::metadata(photo_path).ok()?;
     let file_len = metadata.len();
@@ -199,7 +249,10 @@ fn normalize_profile(profile: &str) -> String {
     if trimmed.is_empty() {
         return "default".to_string();
     }
-    if trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         trimmed.to_string()
     } else {
         "default".to_string()
@@ -208,6 +261,25 @@ fn normalize_profile(profile: &str) -> String {
 
 fn normalize_quality(quality: u8) -> u8 {
     quality.clamp(1, 100)
+}
+
+pub fn rebuild_preview_cache() -> Result<usize, String> {
+    let root = thumbnail_cache_root().ok_or_else(|| "cache root unavailable".to_string())?;
+    if !root.exists() {
+        std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        return Ok(0);
+    }
+
+    let mut removed = 0usize;
+    for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            removed += 1;
+        }
+    }
+
+    std::fs::remove_dir_all(&root).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    Ok(removed)
 }
 
 pub fn export_photos(
@@ -228,7 +300,13 @@ pub fn export_photos(
             conn.query_row(
                 "SELECT relative_path, filename, taken_at FROM photos WHERE id=?1",
                 params![photo_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
         })
         .map_err(|e| e.to_string())?;
@@ -357,7 +435,7 @@ mod tests {
     use super::build_cache_key;
     use super::build_cache_key_v2;
     use super::ensure_preview_cache_path;
-    use super::warmup_preview_cache;
+    use super::warmup_preview_cache_with_progress;
     use image::{ImageBuffer, Rgb};
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -396,16 +474,15 @@ mod tests {
     fn ensure_preview_cache_returns_existing_file_path() {
         let _guard = cache_env_lock().lock().expect("cache env lock");
         let cache_root = create_cache_root();
-        std::env::set_var("MYPHOTO_THUMB_CACHE_ROOT", cache_root.to_string_lossy().as_ref());
+        std::env::set_var(
+            "MYPHOTO_THUMB_CACHE_ROOT",
+            cache_root.to_string_lossy().as_ref(),
+        );
         let src = create_temp_test_image();
 
-        let cache_path = ensure_preview_cache_path(
-            src.to_string_lossy().as_ref(),
-            1600,
-            "preview",
-            82,
-        )
-        .expect("preview cache path should be generated");
+        let cache_path =
+            ensure_preview_cache_path(src.to_string_lossy().as_ref(), 1600, "preview", 82)
+                .expect("preview cache path should be generated");
 
         assert!(PathBuf::from(&cache_path).exists());
 
@@ -419,15 +496,20 @@ mod tests {
     fn warmup_limits_number_of_generated_items() {
         let _guard = cache_env_lock().lock().expect("cache env lock");
         let cache_root = create_cache_root();
-        std::env::set_var("MYPHOTO_THUMB_CACHE_ROOT", cache_root.to_string_lossy().as_ref());
+        std::env::set_var(
+            "MYPHOTO_THUMB_CACHE_ROOT",
+            cache_root.to_string_lossy().as_ref(),
+        );
         let workspace = create_temp_workspace_with_images(3);
 
-        let warmed = warmup_preview_cache(
+        let warmed = warmup_preview_cache_with_progress(
             workspace.to_string_lossy().as_ref(),
             1200,
             "preview",
             82,
+            0,
             2,
+            |_progress| {},
         )
         .expect("warmup should run");
 
@@ -435,6 +517,40 @@ mod tests {
 
         let generated = count_cached_jpegs(&cache_root);
         assert_eq!(generated, 2);
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(cache_root);
+        std::env::remove_var("MYPHOTO_THUMB_CACHE_ROOT");
+    }
+
+    #[test]
+    fn warmup_reports_progress_events() {
+        let _guard = cache_env_lock().lock().expect("cache env lock");
+        let cache_root = create_cache_root();
+        std::env::set_var(
+            "MYPHOTO_THUMB_CACHE_ROOT",
+            cache_root.to_string_lossy().as_ref(),
+        );
+        let workspace = create_temp_workspace_with_images(2);
+
+        let mut steps: Vec<(usize, usize, bool)> = Vec::new();
+        let warmed = warmup_preview_cache_with_progress(
+            workspace.to_string_lossy().as_ref(),
+            1200,
+            "preview",
+            82,
+            0,
+            2,
+            |progress| {
+                steps.push((progress.done, progress.total, progress.finished));
+            },
+        )
+        .expect("warmup should run");
+
+        assert_eq!(warmed, 2);
+        assert!(!steps.is_empty());
+        assert_eq!(steps.first().copied(), Some((0, 2, false)));
+        assert_eq!(steps.last().copied(), Some((2, 2, true)));
 
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(cache_root);
@@ -454,7 +570,8 @@ mod tests {
             .as_nanos();
         path.push(format!("myphoto-imaging-test-{nanos}.jpg"));
 
-        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(8, 8, |_x, _y| Rgb([180, 120, 90]));
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+            ImageBuffer::from_fn(8, 8, |_x, _y| Rgb([180, 120, 90]));
         img.save(&path).expect("write source image");
         path
     }
@@ -481,7 +598,8 @@ mod tests {
 
         for i in 0..count {
             let file = root.join(format!("img-{i:02}.jpg"));
-            let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(8, 8, |_x, _y| Rgb([180, 120, 90]));
+            let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+                ImageBuffer::from_fn(8, 8, |_x, _y| Rgb([180, 120, 90]));
             img.save(file).expect("write source image");
         }
 
@@ -493,7 +611,10 @@ mod tests {
         if !root.exists() {
             return count;
         }
-        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             if entry.file_type().is_file()
                 && entry
                     .path()

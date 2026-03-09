@@ -1,15 +1,15 @@
 mod db;
+mod imaging;
 mod models;
 mod photos;
-mod imaging;
 mod watcher;
 
-use tauri::{State, AppHandle, Emitter};
-use models::*;
-use std::sync::Arc;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crate::db::with_db;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use models::*;
 use rusqlite::params;
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, State};
 
 pub struct AppState {
     pub watcher_manager: Arc<watcher::WatcherManager>,
@@ -18,7 +18,11 @@ pub struct AppState {
 // ─── Workspace Commands ───────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn open_workspace(path: String, app: AppHandle, state: State<'_, AppState>) -> Result<Workspace, String> {
+async fn open_workspace(
+    path: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Workspace, String> {
     let ws = photos::open_or_create_workspace(&path)?;
     let ws_id = ws.id;
     let path_clone = path.clone();
@@ -26,23 +30,43 @@ async fn open_workspace(path: String, app: AppHandle, state: State<'_, AppState>
     let app_for_emit = app.clone();
     let scan_path = path.clone();
     tokio::spawn(async move {
-        match photos::scan_workspace(ws_id, &scan_path) {
-            Ok(count) => {
-                let _ = app_for_emit.emit("scan-complete", serde_json::json!({
+        let app_for_progress = app_for_emit.clone();
+        match photos::scan_workspace_with_progress(ws_id, &scan_path, |progress| {
+            let _ = app_for_progress.emit(
+                "scan-progress",
+                serde_json::json!({
                     "workspace_id": ws_id,
-                    "count": count
-                }));
+                    "phase": progress.phase,
+                    "done": progress.done,
+                    "total": progress.total,
+                    "current_path": progress.current_path,
+                }),
+            );
+        }) {
+            Ok(count) => {
+                let _ = app_for_emit.emit(
+                    "scan-complete",
+                    serde_json::json!({
+                        "workspace_id": ws_id,
+                        "count": count
+                    }),
+                );
             }
             Err(e) => {
-                let _ = app_for_emit.emit("scan-error", serde_json::json!({
-                    "workspace_id": ws_id,
-                    "error": e
-                }));
+                let _ = app_for_emit.emit(
+                    "scan-error",
+                    serde_json::json!({
+                        "workspace_id": ws_id,
+                        "error": e
+                    }),
+                );
             }
         }
     });
 
-    state.watcher_manager.watch_workspace(ws_id, &path_clone, app);
+    state
+        .watcher_manager
+        .watch_workspace(ws_id, &path_clone, app);
     Ok(ws)
 }
 
@@ -80,12 +104,20 @@ async fn get_workspace_present_photo_ids(workspace_id: i64) -> Result<Vec<i64>, 
 }
 
 #[tauri::command]
-async fn sync_created_files(workspace_id: i64, workspace_path: String, paths: Vec<String>) -> Result<usize, String> {
+async fn sync_created_files(
+    workspace_id: i64,
+    workspace_path: String,
+    paths: Vec<String>,
+) -> Result<usize, String> {
     photos::sync_created_files(workspace_id, &workspace_path, &paths)
 }
 
 #[tauri::command]
-async fn sync_removed_files(workspace_id: i64, workspace_path: String, paths: Vec<String>) -> Result<usize, String> {
+async fn sync_removed_files(
+    workspace_id: i64,
+    workspace_path: String,
+    paths: Vec<String>,
+) -> Result<usize, String> {
     photos::sync_removed_files(workspace_id, &workspace_path, &paths)
 }
 
@@ -117,13 +149,41 @@ async fn ensure_preview_cache(
 
 #[tauri::command]
 async fn warmup_previews(
+    workspace_id: i64,
     workspace_path: String,
     size: u32,
     profile: String,
     quality: u8,
+    offset: usize,
     limit: usize,
+    app: AppHandle,
 ) -> Result<usize, String> {
-    imaging::warmup_preview_cache(&workspace_path, size, &profile, quality, limit)
+    imaging::warmup_preview_cache_with_progress(
+        &workspace_path,
+        size,
+        &profile,
+        quality,
+        offset,
+        limit,
+        |progress| {
+            let _ = app.emit(
+                "warmup-progress",
+                serde_json::json!({
+                    "workspace_id": workspace_id,
+                    "done": progress.done,
+                    "total": progress.total,
+                    "succeeded": progress.succeeded,
+                    "current_file": progress.current_file,
+                    "finished": progress.finished,
+                }),
+            );
+        },
+    )
+}
+
+#[tauri::command]
+async fn rebuild_preview_cache() -> Result<usize, String> {
+    imaging::rebuild_preview_cache()
 }
 
 #[tauri::command]
@@ -162,13 +222,18 @@ async fn export_photos(
 
     tokio::spawn(async move {
         while let Ok((done, current)) = rx.recv() {
-            let _ = app_clone.emit("export-progress", serde_json::json!({
-                "total": total,
-                "done": done,
-                "current_file": current,
-                "finished": done >= total
-            }));
-            if done >= total { break; }
+            let _ = app_clone.emit(
+                "export-progress",
+                serde_json::json!({
+                    "total": total,
+                    "done": done,
+                    "current_file": current,
+                    "finished": done >= total
+                }),
+            );
+            if done >= total {
+                break;
+            }
         }
     });
 
@@ -199,7 +264,11 @@ async fn open_in_explorer(path: String) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         std::process::Command::new("xdg-open")
-            .arg(std::path::Path::new(&path).parent().unwrap_or(std::path::Path::new("/")))
+            .arg(
+                std::path::Path::new(&path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("/")),
+            )
             .spawn()
             .map_err(|e| e.to_string())?;
     }
@@ -260,13 +329,21 @@ async fn delete_photos(photo_ids: Vec<i64>, workspace_path: String) -> Result<Ve
 }
 
 #[tauri::command]
-async fn copy_photos(photo_ids: Vec<i64>, workspace_path: String, dest_folder: String) -> Result<usize, String> {
+async fn copy_photos(
+    photo_ids: Vec<i64>,
+    workspace_path: String,
+    dest_folder: String,
+) -> Result<usize, String> {
     let dest = std::path::PathBuf::from(&dest_folder);
     std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
     let mut count = 0;
     for id in photo_ids {
         let rel: Result<String, rusqlite::Error> = with_db(|conn| {
-            conn.query_row("SELECT relative_path FROM photos WHERE id=?1", params![id], |r| r.get(0))
+            conn.query_row(
+                "SELECT relative_path FROM photos WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
         });
         if let Ok(rel) = rel {
             let src = std::path::PathBuf::from(&workspace_path).join(&rel);
@@ -281,13 +358,21 @@ async fn copy_photos(photo_ids: Vec<i64>, workspace_path: String, dest_folder: S
 }
 
 #[tauri::command]
-async fn move_photos(photo_ids: Vec<i64>, workspace_path: String, dest_folder: String) -> Result<usize, String> {
+async fn move_photos(
+    photo_ids: Vec<i64>,
+    workspace_path: String,
+    dest_folder: String,
+) -> Result<usize, String> {
     let dest = std::path::PathBuf::from(&dest_folder);
     std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
     let mut count = 0;
     for id in photo_ids {
         let rel: Result<String, rusqlite::Error> = with_db(|conn| {
-            conn.query_row("SELECT relative_path FROM photos WHERE id=?1", params![id], |r| r.get(0))
+            conn.query_row(
+                "SELECT relative_path FROM photos WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
         });
         if let Ok(rel) = rel {
             let src = std::path::PathBuf::from(&workspace_path).join(&rel);
@@ -297,7 +382,8 @@ async fn move_photos(photo_ids: Vec<i64>, workspace_path: String, dest_folder: S
                 with_db(|conn| {
                     conn.execute("UPDATE photos SET is_missing=1 WHERE id=?1", params![id])?;
                     Ok(())
-                }).ok();
+                })
+                .ok();
                 count += 1;
             }
         }
@@ -352,22 +438,30 @@ async fn delete_entry(path: String, is_dir: bool) -> Result<(), String> {
 #[tauri::command]
 async fn get_keybindings() -> Result<Vec<Keybinding>, String> {
     with_db(|conn| {
-        let mut stmt = conn.prepare("SELECT id, action_id, key_combo, enabled FROM keybindings ORDER BY id")?;
-        let list = stmt.query_map([], |r| Ok(Keybinding {
-            id: r.get(0)?,
-            action_id: r.get(1)?,
-            key_combo: r.get(2)?,
-            enabled: r.get::<_, i64>(3)? != 0,
-        }))?
-        .filter_map(|r| r.ok())
-        .collect();
+        let mut stmt =
+            conn.prepare("SELECT id, action_id, key_combo, enabled FROM keybindings ORDER BY id")?;
+        let list = stmt
+            .query_map([], |r| {
+                Ok(Keybinding {
+                    id: r.get(0)?,
+                    action_id: r.get(1)?,
+                    key_combo: r.get(2)?,
+                    enabled: r.get::<_, i64>(3)? != 0,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
         Ok(list)
     })
     .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn update_keybinding(action_id: String, key_combo: String, enabled: bool) -> Result<(), String> {
+async fn update_keybinding(
+    action_id: String,
+    key_combo: String,
+    enabled: bool,
+) -> Result<(), String> {
     with_db(|conn| {
         conn.execute(
             "UPDATE keybindings SET key_combo=?1, enabled=?2 WHERE action_id=?3",
@@ -391,21 +485,43 @@ async fn save_workspace_settings(workspace_id: i64, settings_json: String) -> Re
 }
 
 #[tauri::command]
-async fn rescan_workspace(workspace_id: i64, workspace_path: String, app: AppHandle) -> Result<(), String> {
+async fn rescan_workspace(
+    workspace_id: i64,
+    workspace_path: String,
+    app: AppHandle,
+) -> Result<(), String> {
     let app_clone = app.clone();
     tokio::spawn(async move {
-        match photos::scan_workspace(workspace_id, &workspace_path) {
-            Ok(count) => {
-                let _ = app_clone.emit("scan-complete", serde_json::json!({
+        let app_for_progress = app_clone.clone();
+        match photos::scan_workspace_with_progress(workspace_id, &workspace_path, |progress| {
+            let _ = app_for_progress.emit(
+                "scan-progress",
+                serde_json::json!({
                     "workspace_id": workspace_id,
-                    "count": count
-                }));
+                    "phase": progress.phase,
+                    "done": progress.done,
+                    "total": progress.total,
+                    "current_path": progress.current_path,
+                }),
+            );
+        }) {
+            Ok(count) => {
+                let _ = app_clone.emit(
+                    "scan-complete",
+                    serde_json::json!({
+                        "workspace_id": workspace_id,
+                        "count": count
+                    }),
+                );
             }
             Err(e) => {
-                let _ = app_clone.emit("scan-error", serde_json::json!({
-                    "workspace_id": workspace_id,
-                    "error": e
-                }));
+                let _ = app_clone.emit(
+                    "scan-error",
+                    serde_json::json!({
+                        "workspace_id": workspace_id,
+                        "error": e
+                    }),
+                );
             }
         }
     });
@@ -441,6 +557,7 @@ pub fn run() {
             get_thumbnail,
             ensure_preview_cache,
             warmup_previews,
+            rebuild_preview_cache,
             update_photo_meta,
             batch_update_meta,
             export_photos,

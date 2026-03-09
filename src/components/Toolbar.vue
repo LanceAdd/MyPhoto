@@ -48,7 +48,7 @@
           class="star-filter-btn"
           :class="{ active: starFilter === n }"
           @click="setStarFilter(n as 1 | 2 | 3 | 4 | 5)"
-          :title="`${n} 星及以上`"
+          :title="`${n} 星`"
         >{{ '★'.repeat(n) }}</button>
         <button
           class="icon-btn"
@@ -124,8 +124,6 @@
         >+</button>
       </div>
 
-      <div class="divider" />
-      <button class="icon-btn" @click="rescan" title="重新扫描">↻</button>
     </div>
   </div>
 </template>
@@ -133,7 +131,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { NSelect } from 'naive-ui'
-import { invoke } from '@tauri-apps/api/core'
 import { useWorkspaceStore } from '../stores/workspace'
 
 type StarFilterValue = 0 | 1 | 2 | 3 | 4 | 5 | 'none'
@@ -245,15 +242,6 @@ function changeThumbnailSize(delta: number) {
   t.thumbnailSize = clampThumb(t.thumbnailSize + delta)
 }
 
-async function rescan() {
-  const t = tab.value
-  if (!t) return
-  t.scanning = true
-  await invoke('rescan_workspace', {
-    workspaceId: t.workspace.id,
-    workspacePath: t.workspace.path,
-  })
-}
 </script>
 
 <style scoped>

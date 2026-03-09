@@ -1,16 +1,15 @@
+use chrono::Utc;
+use rusqlite::params;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-use chrono::Utc;
-use rusqlite::params;
 
 use crate::db::{with_db, with_db_mut};
 use crate::models::{Photo, PhotoFilter, Workspace, WorkspaceFile};
 
 static IMAGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "webp", "tiff", "tif",
-    "bmp", "heic", "heif", "raw", "cr2", "cr3", "nef",
-    "arw", "orf", "rw2", "dng", "pef", "raf",
+    "jpg", "jpeg", "png", "gif", "webp", "tiff", "tif", "bmp", "heic", "heif", "raw", "cr2", "cr3",
+    "nef", "arw", "orf", "rw2", "dng", "pef", "raf",
 ];
 
 fn is_image(path: &Path) -> bool {
@@ -23,18 +22,20 @@ fn is_image(path: &Path) -> bool {
 fn normalize_relative_path(root: &Path, full_path: &Path) -> Option<String> {
     let rel = full_path.strip_prefix(root).ok()?;
     let rel = rel.to_string_lossy().replace('\\', "/");
-    if rel.is_empty() { None } else { Some(rel) }
+    if rel.is_empty() {
+        None
+    } else {
+        Some(rel)
+    }
 }
 
 fn metadata_signature(path: &Path) -> (Option<i64>, Option<String>) {
     let metadata = std::fs::metadata(path).ok();
     let file_size = metadata.as_ref().map(|m| m.len() as i64);
-    let file_modified_at = metadata
-        .and_then(|m| m.modified().ok())
-        .map(|t| {
-            let dt: chrono::DateTime<Utc> = t.into();
-            dt.to_rfc3339()
-        });
+    let file_modified_at = metadata.and_then(|m| m.modified().ok()).map(|t| {
+        let dt: chrono::DateTime<Utc> = t.into();
+        dt.to_rfc3339()
+    });
     (file_size, file_modified_at)
 }
 
@@ -77,6 +78,14 @@ enum ScanAction {
     Rescan,
 }
 
+#[derive(Clone, Debug)]
+pub struct ScanProgress {
+    pub phase: &'static str,
+    pub done: usize,
+    pub total: usize,
+    pub current_path: Option<String>,
+}
+
 fn decide_scan_action(
     existing: Option<&ExistingPhotoState>,
     file_modified_at: &Option<String>,
@@ -95,6 +104,10 @@ fn decide_scan_action(
         }
         _ => ScanAction::Rescan,
     }
+}
+
+fn should_emit_progress(done: usize, total: usize) -> bool {
+    done == 0 || done == total || done <= 5 || done % 25 == 0
 }
 
 pub fn open_or_create_workspace(path: &str) -> Result<Workspace, String> {
@@ -120,21 +133,30 @@ pub fn open_or_create_workspace(path: &str) -> Result<Workspace, String> {
              (SELECT COUNT(*) FROM photos WHERE workspace_id = workspaces.id) as photo_count
              FROM workspaces WHERE path = ?1",
             params![path],
-            |r| Ok(Workspace {
-                id: r.get(0)?,
-                path: r.get(1)?,
-                name: r.get(2)?,
-                last_opened_at: r.get(3)?,
-                settings_json: r.get::<_, String>(4).unwrap_or_default(),
-                photo_count: r.get(5)?,
-            }),
+            |r| {
+                Ok(Workspace {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    name: r.get(2)?,
+                    last_opened_at: r.get(3)?,
+                    settings_json: r.get::<_, String>(4).unwrap_or_default(),
+                    photo_count: r.get(5)?,
+                })
+            },
         )?;
         Ok(ws)
     })
     .map_err(|e| e.to_string())
 }
 
-pub fn scan_workspace(workspace_id: i64, root_path: &str) -> Result<usize, String> {
+pub fn scan_workspace_with_progress<F>(
+    workspace_id: i64,
+    root_path: &str,
+    mut on_progress: F,
+) -> Result<usize, String>
+where
+    F: FnMut(ScanProgress),
+{
     let root = PathBuf::from(root_path);
     let mut count = 0usize;
     let existing_states = with_db(|conn| {
@@ -164,17 +186,26 @@ pub fn scan_workspace(workspace_id: i64, root_path: &str) -> Result<usize, Strin
     let mut seen_paths = HashSet::<String>::new();
     let mut photos_to_upsert: Vec<PendingPhotoUpsert> = Vec::new();
     let mut photos_to_revive: Vec<PendingPhotoRevive> = Vec::new();
-
-    for entry in WalkDir::new(&root)
+    let image_paths: Vec<PathBuf> = WalkDir::new(&root)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file() && is_image(e.path()))
-    {
-        let full_path = entry.path();
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    let scan_total = image_paths.len();
+    on_progress(ScanProgress {
+        phase: "scan_files",
+        done: 0,
+        total: scan_total,
+        current_path: None,
+    });
+
+    for full_path in image_paths {
         let relative = full_path
             .strip_prefix(&root)
-            .unwrap_or(full_path)
+            .unwrap_or(full_path.as_path())
             .to_string_lossy()
             .replace('\\', "/");
         let filename = full_path
@@ -183,12 +214,24 @@ pub fn scan_workspace(workspace_id: i64, root_path: &str) -> Result<usize, Strin
             .unwrap_or("")
             .to_string();
 
-        let (file_size, file_modified_at) = metadata_signature(full_path);
+        let (file_size, file_modified_at) = metadata_signature(full_path.as_path());
 
         seen_paths.insert(relative.clone());
-        match decide_scan_action(existing_states.get(&relative), &file_modified_at, &file_size) {
+        match decide_scan_action(
+            existing_states.get(&relative),
+            &file_modified_at,
+            &file_size,
+        ) {
             ScanAction::Skip => {
                 count += 1;
+                if should_emit_progress(count, scan_total) {
+                    on_progress(ScanProgress {
+                        phase: "scan_files",
+                        done: count,
+                        total: scan_total,
+                        current_path: Some(relative),
+                    });
+                }
                 continue;
             }
             ScanAction::Revive => {
@@ -198,14 +241,37 @@ pub fn scan_workspace(workspace_id: i64, root_path: &str) -> Result<usize, Strin
                     file_modified_at,
                 });
                 count += 1;
+                if should_emit_progress(count, scan_total) {
+                    on_progress(ScanProgress {
+                        phase: "scan_files",
+                        done: count,
+                        total: scan_total,
+                        current_path: Some(
+                            photos_to_revive
+                                .last()
+                                .map(|p| p.relative_path.clone())
+                                .unwrap_or_default(),
+                        ),
+                    });
+                }
                 continue;
             }
             ScanAction::Rescan => {}
         }
 
         // Read EXIF only when file is new or metadata changed.
-        let (taken_at, camera_make, camera_model, lens_model, shutter_speed, aperture, iso, focal_length, width, height) =
-            read_exif_data(full_path);
+        let (
+            taken_at,
+            camera_make,
+            camera_model,
+            lens_model,
+            shutter_speed,
+            aperture,
+            iso,
+            focal_length,
+            width,
+            height,
+        ) = read_exif_data(full_path.as_path());
 
         photos_to_upsert.push(PendingPhotoUpsert {
             relative_path: relative,
@@ -224,9 +290,30 @@ pub fn scan_workspace(workspace_id: i64, root_path: &str) -> Result<usize, Strin
             file_modified_at,
         });
         count += 1;
+        if should_emit_progress(count, scan_total) {
+            on_progress(ScanProgress {
+                phase: "scan_files",
+                done: count,
+                total: scan_total,
+                current_path: Some(
+                    photos_to_upsert
+                        .last()
+                        .map(|p| p.relative_path.clone())
+                        .unwrap_or_default(),
+                ),
+            });
+        }
     }
 
-    if !photos_to_upsert.is_empty() || !photos_to_revive.is_empty() {
+    let upsert_total = photos_to_upsert.len() + photos_to_revive.len();
+    if upsert_total > 0 {
+        on_progress(ScanProgress {
+            phase: "write_database",
+            done: 0,
+            total: upsert_total,
+            current_path: None,
+        });
+        let mut upsert_done = 0usize;
         with_db_mut(|conn| {
             let tx = conn.transaction()?;
             for photo in &photos_to_upsert {
@@ -279,6 +366,15 @@ pub fn scan_workspace(workspace_id: i64, root_path: &str) -> Result<usize, Strin
                         photo.relative_path
                     ],
                 )?;
+                upsert_done += 1;
+                if should_emit_progress(upsert_done, upsert_total) {
+                    on_progress(ScanProgress {
+                        phase: "write_database",
+                        done: upsert_done,
+                        total: upsert_total,
+                        current_path: Some(photo.relative_path.clone()),
+                    });
+                }
             }
 
             for photo in &photos_to_revive {
@@ -293,6 +389,15 @@ pub fn scan_workspace(workspace_id: i64, root_path: &str) -> Result<usize, Strin
                         photo.relative_path
                     ],
                 )?;
+                upsert_done += 1;
+                if should_emit_progress(upsert_done, upsert_total) {
+                    on_progress(ScanProgress {
+                        phase: "write_database",
+                        done: upsert_done,
+                        total: upsert_total,
+                        current_path: Some(photo.relative_path.clone()),
+                    });
+                }
             }
             tx.commit()?;
             Ok(())
@@ -307,6 +412,13 @@ pub fn scan_workspace(workspace_id: i64, root_path: &str) -> Result<usize, Strin
         .collect();
 
     if !missing_paths.is_empty() {
+        on_progress(ScanProgress {
+            phase: "mark_missing",
+            done: 0,
+            total: missing_paths.len(),
+            current_path: None,
+        });
+        let mut missing_done = 0usize;
         with_db_mut(|conn| {
             let tx = conn.transaction()?;
             for rel in &missing_paths {
@@ -314,6 +426,15 @@ pub fn scan_workspace(workspace_id: i64, root_path: &str) -> Result<usize, Strin
                     "UPDATE photos SET is_missing=1 WHERE workspace_id=?1 AND relative_path=?2",
                     params![workspace_id, rel],
                 )?;
+                missing_done += 1;
+                if should_emit_progress(missing_done, missing_paths.len()) {
+                    on_progress(ScanProgress {
+                        phase: "mark_missing",
+                        done: missing_done,
+                        total: missing_paths.len(),
+                        current_path: Some(rel.clone()),
+                    });
+                }
             }
             tx.commit()?;
             Ok(())
@@ -324,10 +445,19 @@ pub fn scan_workspace(workspace_id: i64, root_path: &str) -> Result<usize, Strin
     Ok(count)
 }
 
-fn read_exif_data(path: &Path) -> (
-    Option<String>, Option<String>, Option<String>, Option<String>,
-    Option<String>, Option<f64>, Option<i64>, Option<f64>,
-    Option<i64>, Option<i64>
+fn read_exif_data(
+    path: &Path,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<f64>,
+    Option<i64>,
+    Option<f64>,
+    Option<i64>,
+    Option<i64>,
 ) {
     // Try to get image dimensions from the image crate first
     let (width, height) = image::image_dimensions(path)
@@ -336,13 +466,21 @@ fn read_exif_data(path: &Path) -> (
 
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return (None, None, None, None, None, None, None, None, width, height),
+        Err(_) => {
+            return (
+                None, None, None, None, None, None, None, None, width, height,
+            )
+        }
     };
     let mut bufreader = std::io::BufReader::new(file);
     let exif_reader = exif::Reader::new();
     let exif = match exif_reader.read_from_container(&mut bufreader) {
         Ok(e) => e,
-        Err(_) => return (None, None, None, None, None, None, None, None, width, height),
+        Err(_) => {
+            return (
+                None, None, None, None, None, None, None, None, width, height,
+            )
+        }
     };
 
     let get_str = |tag: exif::Tag| -> Option<String> {
@@ -351,27 +489,25 @@ fn read_exif_data(path: &Path) -> (
     };
 
     let get_f64 = |tag: exif::Tag| -> Option<f64> {
-        exif.get_field(tag, exif::In::PRIMARY)
-            .and_then(|f| {
-                if let exif::Value::Rational(ref v) = f.value {
-                    v.first().map(|r| r.to_f64())
-                } else {
-                    None
-                }
-            })
+        exif.get_field(tag, exif::In::PRIMARY).and_then(|f| {
+            if let exif::Value::Rational(ref v) = f.value {
+                v.first().map(|r| r.to_f64())
+            } else {
+                None
+            }
+        })
     };
 
     let get_u32 = |tag: exif::Tag| -> Option<i64> {
-        exif.get_field(tag, exif::In::PRIMARY)
-            .and_then(|f| {
-                if let exif::Value::Short(ref v) = f.value {
-                    v.first().map(|&n| n as i64)
-                } else if let exif::Value::Long(ref v) = f.value {
-                    v.first().map(|&n| n as i64)
-                } else {
-                    None
-                }
-            })
+        exif.get_field(tag, exif::In::PRIMARY).and_then(|f| {
+            if let exif::Value::Short(ref v) = f.value {
+                v.first().map(|&n| n as i64)
+            } else if let exif::Value::Long(ref v) = f.value {
+                v.first().map(|&n| n as i64)
+            } else {
+                None
+            }
+        })
     };
 
     let taken_at = get_str(exif::Tag::DateTimeOriginal);
@@ -392,7 +528,18 @@ fn read_exif_data(path: &Path) -> (
         (width, height)
     };
 
-    (taken_at, camera_make, camera_model, lens_model, shutter_speed, aperture, iso, focal_length, width, height)
+    (
+        taken_at,
+        camera_make,
+        camera_model,
+        lens_model,
+        shutter_speed,
+        aperture,
+        iso,
+        focal_length,
+        width,
+        height,
+    )
 }
 
 pub fn get_photos(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<Photo>, String> {
@@ -408,7 +555,7 @@ pub fn get_photos(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<Photo>,
             conditions.push("COALESCE(m.star_rating, 0) = 0".to_string());
         } else if let Some(min) = filter.star_min {
             if min > 0 {
-                conditions.push(format!("COALESCE(m.star_rating, 0) >= ?{}", param_idx));
+                conditions.push(format!("COALESCE(m.star_rating, 0) = ?{}", param_idx));
                 param_idx += 1;
             }
         }
@@ -423,7 +570,10 @@ pub fn get_photos(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<Photo>,
                         placeholders.join(",")
                     ));
                 } else {
-                    conditions.push(format!("COALESCE(m.color_label, '') IN ({})", placeholders.join(",")));
+                    conditions.push(format!(
+                        "COALESCE(m.color_label, '') IN ({})",
+                        placeholders.join(",")
+                    ));
                 }
             } else if filter.color_none == Some(true) {
                 conditions.push("COALESCE(m.color_label, '') = ''".to_string());
@@ -441,7 +591,11 @@ pub fn get_photos(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<Photo>,
             Some("star_rating") => "COALESCE(m.star_rating, 0)",
             _ => "COALESCE(p.taken_at, p.filename)",
         };
-        let sort_dir = if filter.sort_desc == Some(true) { "DESC" } else { "ASC" };
+        let sort_dir = if filter.sort_desc == Some(true) {
+            "DESC"
+        } else {
+            "ASC"
+        };
 
         let where_clause = conditions.join(" AND ");
         let sql = format!(
@@ -463,34 +617,40 @@ pub fn get_photos(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<Photo>,
         let ws_id_val = workspace_id;
         let subfolder_like = filter.subfolder.as_ref().map(|s| format!("{}%", s));
 
-        let photos = stmt.query_map(rusqlite::params_from_iter(
-            build_params(ws_id_val, filter, subfolder_like.as_deref())
-        ), |r| {
-            Ok(Photo {
-                id: r.get(0)?,
-                workspace_id: r.get(1)?,
-                relative_path: r.get(2)?,
-                filename: r.get(3)?,
-                file_size: r.get(4)?,
-                width: r.get(5)?,
-                height: r.get(6)?,
-                taken_at: r.get(7)?,
-                camera_make: r.get(8)?,
-                camera_model: r.get(9)?,
-                lens_model: r.get(10)?,
-                shutter_speed: r.get(11)?,
-                aperture: r.get(12)?,
-                iso: r.get(13)?,
-                focal_length: r.get(14)?,
-                file_modified_at: r.get(15)?,
-                is_missing: r.get::<_, i64>(16)? != 0,
-                star_rating: r.get(17)?,
-                color_label: r.get::<_, String>(18).unwrap_or_default(),
-                notes: r.get::<_, String>(19).unwrap_or_default(),
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+        let photos = stmt
+            .query_map(
+                rusqlite::params_from_iter(build_params(
+                    ws_id_val,
+                    filter,
+                    subfolder_like.as_deref(),
+                )),
+                |r| {
+                    Ok(Photo {
+                        id: r.get(0)?,
+                        workspace_id: r.get(1)?,
+                        relative_path: r.get(2)?,
+                        filename: r.get(3)?,
+                        file_size: r.get(4)?,
+                        width: r.get(5)?,
+                        height: r.get(6)?,
+                        taken_at: r.get(7)?,
+                        camera_make: r.get(8)?,
+                        camera_model: r.get(9)?,
+                        lens_model: r.get(10)?,
+                        shutter_speed: r.get(11)?,
+                        aperture: r.get(12)?,
+                        iso: r.get(13)?,
+                        focal_length: r.get(14)?,
+                        file_modified_at: r.get(15)?,
+                        is_missing: r.get::<_, i64>(16)? != 0,
+                        star_rating: r.get(17)?,
+                        color_label: r.get::<_, String>(18).unwrap_or_default(),
+                        notes: r.get::<_, String>(19).unwrap_or_default(),
+                    })
+                },
+            )?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(photos)
     })
@@ -533,15 +693,13 @@ pub fn get_subfolders(_workspace_id: i64, root_path: &str) -> Result<Vec<String>
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file() && is_image(e.path()))
     {
-        let rel = entry.path()
+        let rel = entry
+            .path()
             .strip_prefix(&root)
             .unwrap_or(entry.path())
             .to_string_lossy()
             .replace('\\', "/");
-        let parts: Vec<&str> = rel
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
+        let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
         if parts.len() <= 1 {
             continue;
         }
@@ -568,12 +726,14 @@ pub fn get_workspace_files(root_path: &str) -> Result<Vec<WorkspaceFile>, String
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file() && is_image(e.path()))
     {
-        let rel = entry.path()
+        let rel = entry
+            .path()
             .strip_prefix(&root)
             .unwrap_or(entry.path())
             .to_string_lossy()
             .replace('\\', "/");
-        let filename = entry.path()
+        let filename = entry
+            .path()
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("")
@@ -589,7 +749,12 @@ pub fn get_workspace_files(root_path: &str) -> Result<Vec<WorkspaceFile>, String
     Ok(files)
 }
 
-pub fn update_photo_meta(photo_id: i64, star_rating: i64, color_label: &str, notes: &str) -> Result<(), String> {
+pub fn update_photo_meta(
+    photo_id: i64,
+    star_rating: i64,
+    color_label: &str,
+    notes: &str,
+) -> Result<(), String> {
     let now = Utc::now().to_rfc3339();
     with_db(|conn| {
         conn.execute(
@@ -656,7 +821,7 @@ pub fn get_photos_basic(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<P
                 conditions.push("COALESCE(m.star_rating, 0) = 0".to_string());
             } else if let Some(min) = filter.star_min {
                 if min > 0 {
-                    conditions.push(format!("COALESCE(m.star_rating, 0) >= ?{}", param_idx));
+                    conditions.push(format!("COALESCE(m.star_rating, 0) = ?{}", param_idx));
                     param_idx += 1;
                 }
             }
@@ -748,7 +913,9 @@ pub fn get_photos_basic(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<P
     .map_err(|e| e.to_string())
 }
 
-pub fn get_workspace_photo_meta(workspace_id: i64) -> Result<Vec<crate::models::PhotoMeta>, String> {
+pub fn get_workspace_photo_meta(
+    workspace_id: i64,
+) -> Result<Vec<crate::models::PhotoMeta>, String> {
     with_db(|conn| {
         let mut stmt = conn.prepare(
             "SELECT p.id, COALESCE(m.star_rating, 0), COALESCE(m.color_label, ''), COALESCE(m.notes, '')
@@ -790,7 +957,11 @@ pub fn get_workspace_present_photo_ids(workspace_id: i64) -> Result<Vec<i64>, St
     .map_err(|e| e.to_string())
 }
 
-pub fn sync_created_files(workspace_id: i64, workspace_path: &str, paths: &[String]) -> Result<usize, String> {
+pub fn sync_created_files(
+    workspace_id: i64,
+    workspace_path: &str,
+    paths: &[String],
+) -> Result<usize, String> {
     let root = PathBuf::from(workspace_path);
     let mut candidates: Vec<PathBuf> = Vec::new();
     let mut dedup = HashSet::<String>::new();
@@ -840,8 +1011,18 @@ pub fn sync_created_files(workspace_id: i64, workspace_path: &str, paths: &[Stri
                 .unwrap_or("")
                 .to_string();
             let (file_size, file_modified_at) = metadata_signature(full_path);
-            let (taken_at, camera_make, camera_model, lens_model, shutter_speed, aperture, iso, focal_length, width, height) =
-                read_exif_data(full_path);
+            let (
+                taken_at,
+                camera_make,
+                camera_model,
+                lens_model,
+                shutter_speed,
+                aperture,
+                iso,
+                focal_length,
+                width,
+                height,
+            ) = read_exif_data(full_path);
 
             tx.execute(
                 "INSERT OR IGNORE INTO photos
@@ -902,7 +1083,11 @@ pub fn sync_created_files(workspace_id: i64, workspace_path: &str, paths: &[Stri
     Ok(synced)
 }
 
-pub fn sync_removed_files(workspace_id: i64, workspace_path: &str, paths: &[String]) -> Result<usize, String> {
+pub fn sync_removed_files(
+    workspace_id: i64,
+    workspace_path: &str,
+    paths: &[String],
+) -> Result<usize, String> {
     let root = PathBuf::from(workspace_path);
     let mut file_paths: HashSet<String> = HashSet::new();
     let mut folder_prefixes: HashSet<String> = HashSet::new();
@@ -955,9 +1140,13 @@ pub fn sync_removed_files(workspace_id: i64, workspace_path: &str, paths: &[Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{ExistingPhotoState, ScanAction, decide_scan_action};
+    use super::{decide_scan_action, should_emit_progress, ExistingPhotoState, ScanAction};
 
-    fn existing(file_modified_at: Option<&str>, file_size: Option<i64>, is_missing: bool) -> ExistingPhotoState {
+    fn existing(
+        file_modified_at: Option<&str>,
+        file_size: Option<i64>,
+        is_missing: bool,
+    ) -> ExistingPhotoState {
         ExistingPhotoState {
             file_modified_at: file_modified_at.map(|v| v.to_string()),
             file_size,
@@ -1006,5 +1195,15 @@ mod tests {
         let action = decide_scan_action(None, &current_modified, &current_size);
 
         assert_eq!(action, ScanAction::Rescan);
+    }
+
+    #[test]
+    fn progress_emits_on_expected_boundaries() {
+        assert!(should_emit_progress(0, 100));
+        assert!(should_emit_progress(1, 100));
+        assert!(should_emit_progress(5, 100));
+        assert!(should_emit_progress(25, 100));
+        assert!(should_emit_progress(100, 100));
+        assert!(!should_emit_progress(26, 100));
     }
 }
