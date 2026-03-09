@@ -97,10 +97,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useWorkspaceStore } from '../stores/workspace'
 import RailThumb from './RailThumb.vue'
+import { toTauriImageSrc } from '../utils/image-src'
 
 const store = useWorkspaceStore()
 const tab = computed(() => store.activeTab)
@@ -114,8 +115,15 @@ const currentPhoto = computed(() => photos.value[currentIndex.value] ?? null)
 const cullRef = ref<HTMLElement>()
 const railRef = ref<HTMLElement>()
 const previewSrc = ref<string | null>(null)
+const loadSeq = ref(0)
 const scale = ref(1)
 const rotation = ref(0)
+
+const PREVIEW_SIZE = 1600
+const PREVIEW_PROFILE = 'preview'
+const PREVIEW_QUALITY = 82
+const LEGACY_PREVIEW_SIZE = 1600
+const useCullV2 = readCullV2Flag()
 
 const normalizedRotation = computed(() => {
   const v = rotation.value % 360
@@ -145,6 +153,42 @@ function formatDate(d: string | null) {
   return d.replace('T', ' ').slice(0, 16)
 }
 
+function readCullV2Flag() {
+  const raw = localStorage.getItem('feature.lightbox_streaming_v2')
+  if (raw == null) return true
+  return raw !== 'false'
+}
+
+function fullPathOf(index: number) {
+  const photo = photos.value[index]
+  if (!photo) return null
+  const root = tab.value?.workspace.path
+  if (!root) return null
+  return `${root}/${photo.relative_path}`
+}
+
+function preloadImage(src: string) {
+  return new Promise<boolean>((resolve) => {
+    const img = new Image()
+    img.onload = () => resolve(true)
+    img.onerror = () => resolve(false)
+    img.src = src
+  })
+}
+
+async function loadLegacyPreview(fullPath: string, seq: number) {
+  try {
+    const b64: string = await invoke('get_thumbnail', { photoPath: fullPath, size: LEGACY_PREVIEW_SIZE })
+    if (seq === loadSeq.value) {
+      previewSrc.value = `data:image/jpeg;base64,${b64}`
+    }
+  } catch {
+    if (seq === loadSeq.value) {
+      previewSrc.value = null
+    }
+  }
+}
+
 function zoomBy(multiplier: number) {
   scale.value = Math.max(0.2, Math.min(10, scale.value * multiplier))
 }
@@ -164,22 +208,83 @@ function onPreviewWheel(e: WheelEvent) {
 }
 
 async function loadPreview() {
+  const seq = ++loadSeq.value
   const photo = currentPhoto.value
   if (!photo || photo.is_missing) {
     previewSrc.value = null
     return
   }
   resetTransform()
-  const fullPath = `${tab.value?.workspace.path}/${photo.relative_path}`
+  previewSrc.value = null
+
+  const fullPath = fullPathOf(currentIndex.value)
+  if (!fullPath) return
+
+  if (!useCullV2) {
+    await loadLegacyPreview(fullPath, seq)
+    return
+  }
+
+  let showedPreview = false
   try {
-    const b64: string = await invoke('get_thumbnail', { photoPath: fullPath, size: 1600 })
-    previewSrc.value = `data:image/jpeg;base64,${b64}`
+    const cachedPath: string = await invoke('ensure_preview_cache', {
+      photoPath: fullPath,
+      size: PREVIEW_SIZE,
+      profile: PREVIEW_PROFILE,
+      quality: PREVIEW_QUALITY,
+    })
+    if (seq !== loadSeq.value) return
+    const src = toTauriImageSrc(cachedPath)
+    const ready = await preloadImage(src)
+    if (seq !== loadSeq.value) return
+    if (ready) {
+      previewSrc.value = src
+      showedPreview = true
+    }
   } catch {
-    previewSrc.value = null
+    // keep fallback logic below
+  }
+
+  const originalSrc = toTauriImageSrc(fullPath)
+  const originalReady = await preloadImage(originalSrc)
+  if (seq !== loadSeq.value) return
+  if (originalReady) {
+    previewSrc.value = originalSrc
+    return
+  }
+
+  if (!showedPreview) {
+    await loadLegacyPreview(fullPath, seq)
   }
 }
 
-watch(currentIndex, loadPreview, { immediate: true })
+function prefetchNeighbors(center: number) {
+  const offsets = [-2, -1, 1, 2]
+  for (const offset of offsets) {
+    const idx = center + offset
+    if (idx < 0 || idx >= photos.value.length) continue
+    const photo = photos.value[idx]
+    if (!photo || photo.is_missing) continue
+    const fullPath = fullPathOf(idx)
+    if (!fullPath) continue
+
+    void invoke('ensure_preview_cache', {
+      photoPath: fullPath,
+      size: PREVIEW_SIZE,
+      profile: PREVIEW_PROFILE,
+      quality: PREVIEW_QUALITY,
+    }).catch(() => {})
+
+    if (Math.abs(offset) === 1) {
+      void preloadImage(toTauriImageSrc(fullPath))
+    }
+  }
+}
+
+watch(currentIndex, (idx) => {
+  void loadPreview()
+  prefetchNeighbors(idx)
+}, { immediate: true })
 watch(() => photos.value.length, () => {
   if (currentIndex.value >= photos.value.length) {
     store.setCullIndex(Math.max(0, photos.value.length - 1))
@@ -244,7 +349,10 @@ function scrollRailToItem(el: HTMLElement) {
 
 onMounted(() => {
   cullRef.value?.focus()
-  loadPreview()
+})
+
+onUnmounted(() => {
+  loadSeq.value += 1
 })
 </script>
 
