@@ -116,6 +116,17 @@ async fn ensure_preview_cache(
 }
 
 #[tauri::command]
+async fn warmup_previews(
+    workspace_path: String,
+    size: u32,
+    profile: String,
+    quality: u8,
+    limit: usize,
+) -> Result<usize, String> {
+    imaging::warmup_preview_cache(&workspace_path, size, &profile, quality, limit)
+}
+
+#[tauri::command]
 async fn update_photo_meta(
     photo_id: i64,
     star_rating: i64,
@@ -429,6 +440,7 @@ pub fn run() {
             get_workspace_files,
             get_thumbnail,
             ensure_preview_cache,
+            warmup_previews,
             update_photo_meta,
             batch_update_meta,
             export_photos,

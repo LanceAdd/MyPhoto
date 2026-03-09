@@ -58,6 +58,28 @@ pub fn ensure_preview_cache_path(
     Ok(cache_path.to_string_lossy().to_string())
 }
 
+pub fn warmup_preview_cache(
+    workspace_path: &str,
+    size: u32,
+    profile: &str,
+    quality: u8,
+    limit: usize,
+) -> Result<usize, String> {
+    if limit == 0 {
+        return Ok(0);
+    }
+
+    let files = crate::photos::get_workspace_files(workspace_path)?;
+    let mut warmed = 0usize;
+    for file in files.into_iter().take(limit) {
+        let full = PathBuf::from(workspace_path).join(file.relative_path);
+        if ensure_preview_cache_path(full.to_string_lossy().as_ref(), size, profile, quality).is_ok() {
+            warmed += 1;
+        }
+    }
+    Ok(warmed)
+}
+
 fn resolve_thumbnail_cache_path(photo_path: &str, size: u32) -> Option<PathBuf> {
     let root = thumbnail_cache_root()?;
     let metadata = std::fs::metadata(photo_path).ok()?;
@@ -335,8 +357,10 @@ mod tests {
     use super::build_cache_key;
     use super::build_cache_key_v2;
     use super::ensure_preview_cache_path;
+    use super::warmup_preview_cache;
     use image::{ImageBuffer, Rgb};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -370,6 +394,7 @@ mod tests {
 
     #[test]
     fn ensure_preview_cache_returns_existing_file_path() {
+        let _guard = cache_env_lock().lock().expect("cache env lock");
         let cache_root = create_cache_root();
         std::env::set_var("MYPHOTO_THUMB_CACHE_ROOT", cache_root.to_string_lossy().as_ref());
         let src = create_temp_test_image();
@@ -388,6 +413,37 @@ mod tests {
         let _ = std::fs::remove_file(cache_path);
         let _ = std::fs::remove_dir_all(cache_root);
         std::env::remove_var("MYPHOTO_THUMB_CACHE_ROOT");
+    }
+
+    #[test]
+    fn warmup_limits_number_of_generated_items() {
+        let _guard = cache_env_lock().lock().expect("cache env lock");
+        let cache_root = create_cache_root();
+        std::env::set_var("MYPHOTO_THUMB_CACHE_ROOT", cache_root.to_string_lossy().as_ref());
+        let workspace = create_temp_workspace_with_images(3);
+
+        let warmed = warmup_preview_cache(
+            workspace.to_string_lossy().as_ref(),
+            1200,
+            "preview",
+            82,
+            2,
+        )
+        .expect("warmup should run");
+
+        assert_eq!(warmed, 2);
+
+        let generated = count_cached_jpegs(&cache_root);
+        assert_eq!(generated, 2);
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(cache_root);
+        std::env::remove_var("MYPHOTO_THUMB_CACHE_ROOT");
+    }
+
+    fn cache_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     fn create_temp_test_image() -> PathBuf {
@@ -412,5 +468,42 @@ mod tests {
         path.push(format!("target/myphoto-test-cache-{nanos}"));
         std::fs::create_dir_all(&path).expect("create cache root");
         path
+    }
+
+    fn create_temp_workspace_with_images(count: usize) -> PathBuf {
+        let mut root = std::env::current_dir().expect("current dir");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        root.push(format!("target/myphoto-test-workspace-{nanos}"));
+        std::fs::create_dir_all(&root).expect("create workspace root");
+
+        for i in 0..count {
+            let file = root.join(format!("img-{i:02}.jpg"));
+            let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(8, 8, |_x, _y| Rgb([180, 120, 90]));
+            img.save(file).expect("write source image");
+        }
+
+        root
+    }
+
+    fn count_cached_jpegs(root: &Path) -> usize {
+        let mut count = 0usize;
+        if !root.exists() {
+            return count;
+        }
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))
+            {
+                count += 1;
+            }
+        }
+        count
     }
 }
