@@ -258,8 +258,13 @@ async function loadImage() {
       quality: PREVIEW_QUALITY,
     })
     if (seq !== loadSeq.value) return
-    imgSrc.value = toTauriImageSrc(previewPath)
-    previewShown = true
+    const previewSrc = toTauriImageSrc(previewPath)
+    const previewReady = await preloadImage(previewSrc)
+    if (seq !== loadSeq.value) return
+    if (previewReady) {
+      imgSrc.value = previewSrc
+      previewShown = true
+    }
   } catch {
     // keep fallback path below
   }
