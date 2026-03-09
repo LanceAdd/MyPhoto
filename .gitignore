@@ -52,5 +52,8 @@ skills-lock.json
 # Design docs / planning notes (local only)
 docs/
 
+# Local git worktrees
+.worktrees/
+
 # OS
 Thumbs.db
