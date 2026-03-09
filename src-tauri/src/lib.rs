@@ -106,6 +106,16 @@ async fn get_thumbnail(photo_path: String, size: u32) -> Result<String, String> 
 }
 
 #[tauri::command]
+async fn ensure_preview_cache(
+    photo_path: String,
+    size: u32,
+    profile: String,
+    quality: u8,
+) -> Result<String, String> {
+    imaging::ensure_preview_cache_path(&photo_path, size, &profile, quality)
+}
+
+#[tauri::command]
 async fn update_photo_meta(
     photo_id: i64,
     star_rating: i64,
@@ -418,6 +428,7 @@ pub fn run() {
             get_subfolders,
             get_workspace_files,
             get_thumbnail,
+            ensure_preview_cache,
             update_photo_meta,
             batch_update_meta,
             export_photos,
