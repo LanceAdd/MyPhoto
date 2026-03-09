@@ -75,9 +75,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useWorkspaceStore, type Photo } from '../stores/workspace'
+import { toTauriImageSrc } from '../utils/image-src'
 
 const props = defineProps<{ photo: Photo }>()
 const emit = defineEmits<{ close: [] }>()
@@ -89,10 +90,17 @@ const currentPhoto = computed(() => allPhotos.value[currentIndex.value] ?? null)
 
 const boxRef = ref<HTMLElement>()
 const imgSrc = ref<string | null>(null)
+const loadSeq = ref(0)
 const scale = ref(1)
 const rotation = ref(0)
 const translateX = ref(0)
 const translateY = ref(0)
+
+const PREVIEW_SIZE = 1600
+const PREVIEW_PROFILE = 'preview'
+const PREVIEW_QUALITY = 82
+const LEGACY_LIGHTBOX_SIZE = 2400
+const useLightboxV2 = readLightboxV2Flag()
 
 const normalizedRotation = computed(() => {
   const v = rotation.value % 360
@@ -166,7 +174,65 @@ function formatDate(d: string | null) {
   return d?.replace('T', ' ').slice(0, 16) ?? '-'
 }
 
+function readLightboxV2Flag() {
+  const raw = localStorage.getItem('feature.lightbox_streaming_v2')
+  if (raw == null) return true
+  return raw !== 'false'
+}
+
+function fullPathOf(photo: Photo): string | null {
+  const root = store.activeTab?.workspace.path
+  if (!root) return null
+  return `${root}/${photo.relative_path}`
+}
+
+function preloadImage(src: string) {
+  return new Promise<boolean>((resolve) => {
+    const img = new Image()
+    img.onload = () => resolve(true)
+    img.onerror = () => resolve(false)
+    img.src = src
+  })
+}
+
+async function loadLegacy(fullPath: string, seq: number) {
+  try {
+    const b64: string = await invoke('get_thumbnail', { photoPath: fullPath, size: LEGACY_LIGHTBOX_SIZE })
+    if (seq === loadSeq.value) {
+      imgSrc.value = `data:image/jpeg;base64,${b64}`
+    }
+  } catch {
+    if (seq === loadSeq.value) {
+      imgSrc.value = null
+    }
+  }
+}
+
+function prefetchNeighbors(center: number) {
+  const offsets = [-2, -1, 1, 2]
+  for (const offset of offsets) {
+    const idx = center + offset
+    if (idx < 0 || idx >= allPhotos.value.length) continue
+    const photo = allPhotos.value[idx]
+    if (!photo || photo.is_missing) continue
+    const fullPath = fullPathOf(photo)
+    if (!fullPath) continue
+
+    void invoke('ensure_preview_cache', {
+      photoPath: fullPath,
+      size: PREVIEW_SIZE,
+      profile: PREVIEW_PROFILE,
+      quality: PREVIEW_QUALITY,
+    }).catch(() => {})
+
+    if (Math.abs(offset) === 1) {
+      void preloadImage(toTauriImageSrc(fullPath))
+    }
+  }
+}
+
 async function loadImage() {
+  const seq = ++loadSeq.value
   const photo = currentPhoto.value
   if (!photo || photo.is_missing) {
     imgSrc.value = null
@@ -174,16 +240,47 @@ async function loadImage() {
   }
   resetTransform()
   imgSrc.value = null
-  const fullPath = `${store.activeTab?.workspace.path}/${photo.relative_path}`
+
+  const fullPath = fullPathOf(photo)
+  if (!fullPath) return
+
+  if (!useLightboxV2) {
+    await loadLegacy(fullPath, seq)
+    return
+  }
+
+  let previewShown = false
   try {
-    const b64: string = await invoke('get_thumbnail', { photoPath: fullPath, size: 2400 })
-    imgSrc.value = `data:image/jpeg;base64,${b64}`
+    const previewPath: string = await invoke('ensure_preview_cache', {
+      photoPath: fullPath,
+      size: PREVIEW_SIZE,
+      profile: PREVIEW_PROFILE,
+      quality: PREVIEW_QUALITY,
+    })
+    if (seq !== loadSeq.value) return
+    imgSrc.value = toTauriImageSrc(previewPath)
+    previewShown = true
   } catch {
-    imgSrc.value = null
+    // keep fallback path below
+  }
+
+  const originalSrc = toTauriImageSrc(fullPath)
+  const originalReady = await preloadImage(originalSrc)
+  if (seq !== loadSeq.value) return
+  if (originalReady) {
+    imgSrc.value = originalSrc
+    return
+  }
+
+  if (!previewShown) {
+    await loadLegacy(fullPath, seq)
   }
 }
 
-watch(currentIndex, loadImage, { immediate: true })
+watch(currentIndex, (idx) => {
+  void loadImage()
+  prefetchNeighbors(idx)
+}, { immediate: true })
 
 function navigate(delta: number) {
   const next = currentIndex.value + delta
@@ -225,6 +322,10 @@ async function setColor(c: string) {
 
 onMounted(() => {
   nextTick(() => boxRef.value?.focus())
+})
+
+onUnmounted(() => {
+  loadSeq.value += 1
 })
 </script>
 

@@ -122,6 +122,14 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     tabs.value.push(tab)
     activeTabIndex.value = tabs.value.length - 1
 
+    void invoke('warmup_previews', {
+      workspacePath: ws.path,
+      size: 1600,
+      profile: 'preview',
+      quality: 82,
+      limit: 200,
+    }).catch(() => {})
+
     const tabIndex = activeTabIndex.value
     void loadPhotos(tabIndex, { refreshMeta: true })
       .then(() => {
