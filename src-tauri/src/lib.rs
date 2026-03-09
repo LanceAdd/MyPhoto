@@ -65,6 +65,31 @@ async fn get_photos(workspace_id: i64, filter: PhotoFilter) -> Result<Vec<Photo>
 }
 
 #[tauri::command]
+async fn get_photos_basic(workspace_id: i64, filter: PhotoFilter) -> Result<Vec<Photo>, String> {
+    photos::get_photos_basic(workspace_id, &filter)
+}
+
+#[tauri::command]
+async fn get_workspace_photo_meta(workspace_id: i64) -> Result<Vec<PhotoMeta>, String> {
+    photos::get_workspace_photo_meta(workspace_id)
+}
+
+#[tauri::command]
+async fn get_workspace_present_photo_ids(workspace_id: i64) -> Result<Vec<i64>, String> {
+    photos::get_workspace_present_photo_ids(workspace_id)
+}
+
+#[tauri::command]
+async fn sync_created_files(workspace_id: i64, workspace_path: String, paths: Vec<String>) -> Result<usize, String> {
+    photos::sync_created_files(workspace_id, &workspace_path, &paths)
+}
+
+#[tauri::command]
+async fn sync_removed_files(workspace_id: i64, workspace_path: String, paths: Vec<String>) -> Result<usize, String> {
+    photos::sync_removed_files(workspace_id, &workspace_path, &paths)
+}
+
+#[tauri::command]
 async fn get_subfolders(workspace_id: i64, root_path: String) -> Result<Vec<String>, String> {
     photos::get_subfolders(workspace_id, &root_path)
 }
@@ -385,6 +410,11 @@ pub fn run() {
             close_workspace,
             get_recent_workspaces,
             get_photos,
+            get_photos_basic,
+            get_workspace_photo_meta,
+            get_workspace_present_photo_ids,
+            sync_created_files,
+            sync_removed_files,
             get_subfolders,
             get_workspace_files,
             get_thumbnail,

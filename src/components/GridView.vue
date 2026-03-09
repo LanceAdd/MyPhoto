@@ -12,8 +12,9 @@
     </div>
 
     <!-- Empty -->
-    <div v-else-if="photos.length === 0" class="empty">
-      <span>📷</span><p>此文件夹中没有照片</p>
+    <div v-if="photos.length === 0" class="empty">
+      <span>📷</span>
+      <p>{{ tab?.scanning ? '正在扫描照片...' : '此文件夹中没有照片' }}</p>
     </div>
 
     <!-- Virtual grid -->

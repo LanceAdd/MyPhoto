@@ -1,10 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use chrono::Utc;
 use rusqlite::params;
 
-use crate::db::with_db;
+use crate::db::{with_db, with_db_mut};
 use crate::models::{Photo, PhotoFilter, Workspace, WorkspaceFile};
 
 static IMAGE_EXTENSIONS: &[&str] = &[
@@ -18,6 +18,83 @@ fn is_image(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| IMAGE_EXTENSIONS.contains(&e.to_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+fn normalize_relative_path(root: &Path, full_path: &Path) -> Option<String> {
+    let rel = full_path.strip_prefix(root).ok()?;
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    if rel.is_empty() { None } else { Some(rel) }
+}
+
+fn metadata_signature(path: &Path) -> (Option<i64>, Option<String>) {
+    let metadata = std::fs::metadata(path).ok();
+    let file_size = metadata.as_ref().map(|m| m.len() as i64);
+    let file_modified_at = metadata
+        .and_then(|m| m.modified().ok())
+        .map(|t| {
+            let dt: chrono::DateTime<Utc> = t.into();
+            dt.to_rfc3339()
+        });
+    (file_size, file_modified_at)
+}
+
+#[derive(Debug)]
+struct PendingPhotoUpsert {
+    relative_path: String,
+    filename: String,
+    file_size: Option<i64>,
+    width: Option<i64>,
+    height: Option<i64>,
+    taken_at: Option<String>,
+    camera_make: Option<String>,
+    camera_model: Option<String>,
+    lens_model: Option<String>,
+    shutter_speed: Option<String>,
+    aperture: Option<f64>,
+    iso: Option<i64>,
+    focal_length: Option<f64>,
+    file_modified_at: Option<String>,
+}
+
+#[derive(Debug)]
+struct PendingPhotoRevive {
+    relative_path: String,
+    file_size: Option<i64>,
+    file_modified_at: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ExistingPhotoState {
+    file_modified_at: Option<String>,
+    file_size: Option<i64>,
+    is_missing: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ScanAction {
+    Skip,
+    Revive,
+    Rescan,
+}
+
+fn decide_scan_action(
+    existing: Option<&ExistingPhotoState>,
+    file_modified_at: &Option<String>,
+    file_size: &Option<i64>,
+) -> ScanAction {
+    match existing {
+        Some(state)
+            if state.file_modified_at.as_deref() == file_modified_at.as_deref()
+                && state.file_size == *file_size =>
+        {
+            if state.is_missing {
+                ScanAction::Revive
+            } else {
+                ScanAction::Skip
+            }
+        }
+        _ => ScanAction::Rescan,
+    }
 }
 
 pub fn open_or_create_workspace(path: &str) -> Result<Workspace, String> {
@@ -60,6 +137,33 @@ pub fn open_or_create_workspace(path: &str) -> Result<Workspace, String> {
 pub fn scan_workspace(workspace_id: i64, root_path: &str) -> Result<usize, String> {
     let root = PathBuf::from(root_path);
     let mut count = 0usize;
+    let existing_states = with_db(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT relative_path, file_modified_at, file_size, is_missing
+             FROM photos WHERE workspace_id=?1",
+        )?;
+        let mut map = HashMap::<String, ExistingPhotoState>::new();
+        let rows = stmt.query_map(params![workspace_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                ExistingPhotoState {
+                    file_modified_at: r.get(1)?,
+                    file_size: r.get(2)?,
+                    is_missing: r.get::<_, i64>(3)? != 0,
+                },
+            ))
+        })?;
+
+        for row in rows.filter_map(|v| v.ok()) {
+            map.insert(row.0, row.1);
+        }
+        Ok(map)
+    })
+    .map_err(|e| e.to_string())?;
+
+    let mut seen_paths = HashSet::<String>::new();
+    let mut photos_to_upsert: Vec<PendingPhotoUpsert> = Vec::new();
+    let mut photos_to_revive: Vec<PendingPhotoRevive> = Vec::new();
 
     for entry in WalkDir::new(&root)
         .follow_links(false)
@@ -79,61 +183,143 @@ pub fn scan_workspace(workspace_id: i64, root_path: &str) -> Result<usize, Strin
             .unwrap_or("")
             .to_string();
 
-        let metadata = std::fs::metadata(full_path).ok();
-        let file_size = metadata.as_ref().map(|m| m.len() as i64);
-        let file_modified_at = metadata
-            .and_then(|m| m.modified().ok())
-            .map(|t| {
-                let dt: chrono::DateTime<Utc> = t.into();
-                dt.to_rfc3339()
-            });
+        let (file_size, file_modified_at) = metadata_signature(full_path);
 
-        // Read EXIF
+        seen_paths.insert(relative.clone());
+        match decide_scan_action(existing_states.get(&relative), &file_modified_at, &file_size) {
+            ScanAction::Skip => {
+                count += 1;
+                continue;
+            }
+            ScanAction::Revive => {
+                photos_to_revive.push(PendingPhotoRevive {
+                    relative_path: relative,
+                    file_size,
+                    file_modified_at,
+                });
+                count += 1;
+                continue;
+            }
+            ScanAction::Rescan => {}
+        }
+
+        // Read EXIF only when file is new or metadata changed.
         let (taken_at, camera_make, camera_model, lens_model, shutter_speed, aperture, iso, focal_length, width, height) =
             read_exif_data(full_path);
 
-        let _ = with_db(|conn| {
-            conn.execute(
-                "INSERT OR IGNORE INTO photos
-                 (workspace_id, relative_path, filename, file_size, width, height,
-                  taken_at, camera_make, camera_model, lens_model, shutter_speed,
-                  aperture, iso, focal_length, file_modified_at, is_missing)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,0)",
-                params![
-                    workspace_id, relative, filename, file_size, width, height,
-                    taken_at, camera_make, camera_model, lens_model, shutter_speed,
-                    aperture, iso, focal_length, file_modified_at
-                ],
-            )?;
-            // Update file_modified_at and clear is_missing for existing
-            conn.execute(
-                "UPDATE photos SET file_modified_at=?1, is_missing=0 WHERE workspace_id=?2 AND relative_path=?3",
-                params![file_modified_at, workspace_id, relative],
-            )?;
-            Ok(())
+        photos_to_upsert.push(PendingPhotoUpsert {
+            relative_path: relative,
+            filename,
+            file_size,
+            width,
+            height,
+            taken_at,
+            camera_make,
+            camera_model,
+            lens_model,
+            shutter_speed,
+            aperture,
+            iso,
+            focal_length,
+            file_modified_at,
         });
         count += 1;
     }
 
-    // Mark missing files
-    let _ = with_db(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, relative_path FROM photos WHERE workspace_id=?1 AND is_missing=0",
-        )?;
-        let rows: Vec<(i64, String)> = stmt.query_map(params![workspace_id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?
-        .filter_map(|r| r.ok())
+    if !photos_to_upsert.is_empty() || !photos_to_revive.is_empty() {
+        with_db_mut(|conn| {
+            let tx = conn.transaction()?;
+            for photo in &photos_to_upsert {
+                tx.execute(
+                    "INSERT OR IGNORE INTO photos
+                     (workspace_id, relative_path, filename, file_size, width, height,
+                      taken_at, camera_make, camera_model, lens_model, shutter_speed,
+                      aperture, iso, focal_length, file_modified_at, is_missing)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,0)",
+                    params![
+                        workspace_id,
+                        photo.relative_path,
+                        photo.filename,
+                        photo.file_size,
+                        photo.width,
+                        photo.height,
+                        photo.taken_at,
+                        photo.camera_make,
+                        photo.camera_model,
+                        photo.lens_model,
+                        photo.shutter_speed,
+                        photo.aperture,
+                        photo.iso,
+                        photo.focal_length,
+                        photo.file_modified_at
+                    ],
+                )?;
+                tx.execute(
+                    "UPDATE photos
+                     SET filename=?1, file_size=?2, width=?3, height=?4,
+                         taken_at=?5, camera_make=?6, camera_model=?7, lens_model=?8,
+                         shutter_speed=?9, aperture=?10, iso=?11, focal_length=?12,
+                         file_modified_at=?13, is_missing=0
+                     WHERE workspace_id=?14 AND relative_path=?15",
+                    params![
+                        photo.filename,
+                        photo.file_size,
+                        photo.width,
+                        photo.height,
+                        photo.taken_at,
+                        photo.camera_make,
+                        photo.camera_model,
+                        photo.lens_model,
+                        photo.shutter_speed,
+                        photo.aperture,
+                        photo.iso,
+                        photo.focal_length,
+                        photo.file_modified_at,
+                        workspace_id,
+                        photo.relative_path
+                    ],
+                )?;
+            }
+
+            for photo in &photos_to_revive {
+                tx.execute(
+                    "UPDATE photos
+                     SET file_size=?1, file_modified_at=?2, is_missing=0
+                     WHERE workspace_id=?3 AND relative_path=?4",
+                    params![
+                        photo.file_size,
+                        photo.file_modified_at,
+                        workspace_id,
+                        photo.relative_path
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    }
+
+    let missing_paths: Vec<String> = existing_states
+        .keys()
+        .filter(|rel| !seen_paths.contains(*rel))
+        .cloned()
         .collect();
 
-        for (id, rel) in rows {
-            let full = root.join(&rel);
-            if !full.exists() {
-                conn.execute("UPDATE photos SET is_missing=1 WHERE id=?1", params![id])?;
+    if !missing_paths.is_empty() {
+        with_db_mut(|conn| {
+            let tx = conn.transaction()?;
+            for rel in &missing_paths {
+                tx.execute(
+                    "UPDATE photos SET is_missing=1 WHERE workspace_id=?1 AND relative_path=?2",
+                    params![workspace_id, rel],
+                )?;
             }
-        }
-        Ok(())
-    });
+            tx.commit()?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    }
 
     Ok(count)
 }
@@ -441,4 +627,384 @@ pub fn get_recent_workspaces() -> Result<Vec<Workspace>, String> {
         Ok(list)
     })
     .map_err(|e| e.to_string())
+}
+
+fn filter_requires_meta_join(filter: &PhotoFilter) -> bool {
+    filter.star_none == Some(true)
+        || filter.star_min.unwrap_or(0) > 0
+        || filter.color_none == Some(true)
+        || filter
+            .color_labels
+            .as_ref()
+            .map(|labels| !labels.is_empty())
+            .unwrap_or(false)
+        || filter.sort_by.as_deref() == Some("star_rating")
+}
+
+pub fn get_photos_basic(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<Photo>, String> {
+    with_db(|conn| {
+        let use_meta_join = filter_requires_meta_join(filter);
+        let mut conditions = vec!["p.workspace_id = ?1".to_string()];
+        let mut param_idx = 2usize;
+
+        if let Some(ref _subfolder) = filter.subfolder {
+            conditions.push(format!("p.relative_path LIKE ?{}", param_idx));
+            param_idx += 1;
+        }
+        if use_meta_join {
+            if filter.star_none == Some(true) {
+                conditions.push("COALESCE(m.star_rating, 0) = 0".to_string());
+            } else if let Some(min) = filter.star_min {
+                if min > 0 {
+                    conditions.push(format!("COALESCE(m.star_rating, 0) >= ?{}", param_idx));
+                    param_idx += 1;
+                }
+            }
+            if let Some(ref labels) = filter.color_labels {
+                if !labels.is_empty() {
+                    let placeholders: Vec<String> = (0..labels.len())
+                        .map(|i| format!("?{}", param_idx + i))
+                        .collect();
+                    if filter.color_none == Some(true) {
+                        conditions.push(format!(
+                            "(COALESCE(m.color_label, '') IN ({}) OR COALESCE(m.color_label, '') = '')",
+                            placeholders.join(",")
+                        ));
+                    } else {
+                        conditions.push(format!("COALESCE(m.color_label, '') IN ({})", placeholders.join(",")));
+                    }
+                } else if filter.color_none == Some(true) {
+                    conditions.push("COALESCE(m.color_label, '') = ''".to_string());
+                }
+            } else if filter.color_none == Some(true) {
+                conditions.push("COALESCE(m.color_label, '') = ''".to_string());
+            }
+        }
+        if filter.include_missing != Some(true) {
+            conditions.push("p.is_missing = 0".to_string());
+        }
+
+        let sort_col = match filter.sort_by.as_deref() {
+            Some("filename") => "p.filename",
+            Some("file_size") => "p.file_size",
+            Some("star_rating") if use_meta_join => "COALESCE(m.star_rating, 0)",
+            _ => "COALESCE(p.taken_at, p.filename)",
+        };
+        let sort_dir = if filter.sort_desc == Some(true) { "DESC" } else { "ASC" };
+
+        let where_clause = conditions.join(" AND ");
+        let from_clause = if use_meta_join {
+            "FROM photos p LEFT JOIN photo_meta m ON m.photo_id = p.id"
+        } else {
+            "FROM photos p"
+        };
+        let sql = format!(
+            "SELECT p.id, p.workspace_id, p.relative_path, p.filename, p.file_size,
+             p.width, p.height, p.taken_at, p.camera_make, p.camera_model, p.lens_model,
+             p.shutter_speed, p.aperture, p.iso, p.focal_length, p.file_modified_at,
+             p.is_missing
+             {}
+             WHERE {}
+             ORDER BY {} {}",
+            from_clause, where_clause, sort_col, sort_dir
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let ws_id_val = workspace_id;
+        let subfolder_like = filter.subfolder.as_ref().map(|s| format!("{}%", s));
+
+        let photos = stmt.query_map(
+            rusqlite::params_from_iter(build_params(ws_id_val, filter, subfolder_like.as_deref())),
+            |r| {
+                Ok(Photo {
+                    id: r.get(0)?,
+                    workspace_id: r.get(1)?,
+                    relative_path: r.get(2)?,
+                    filename: r.get(3)?,
+                    file_size: r.get(4)?,
+                    width: r.get(5)?,
+                    height: r.get(6)?,
+                    taken_at: r.get(7)?,
+                    camera_make: r.get(8)?,
+                    camera_model: r.get(9)?,
+                    lens_model: r.get(10)?,
+                    shutter_speed: r.get(11)?,
+                    aperture: r.get(12)?,
+                    iso: r.get(13)?,
+                    focal_length: r.get(14)?,
+                    file_modified_at: r.get(15)?,
+                    is_missing: r.get::<_, i64>(16)? != 0,
+                    star_rating: 0,
+                    color_label: String::new(),
+                    notes: String::new(),
+                })
+            },
+        )?
+        .filter_map(|r| r.ok())
+        .collect();
+
+        Ok(photos)
+    })
+    .map_err(|e| e.to_string())
+}
+
+pub fn get_workspace_photo_meta(workspace_id: i64) -> Result<Vec<crate::models::PhotoMeta>, String> {
+    with_db(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT p.id, COALESCE(m.star_rating, 0), COALESCE(m.color_label, ''), COALESCE(m.notes, '')
+             FROM photos p
+             LEFT JOIN photo_meta m ON m.photo_id = p.id
+             WHERE p.workspace_id = ?1",
+        )?;
+
+        let list = stmt
+            .query_map(params![workspace_id], |r| {
+                Ok(crate::models::PhotoMeta {
+                    photo_id: r.get(0)?,
+                    star_rating: r.get(1)?,
+                    color_label: r.get::<_, String>(2).unwrap_or_default(),
+                    notes: r.get::<_, String>(3).unwrap_or_default(),
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(list)
+    })
+    .map_err(|e| e.to_string())
+}
+
+pub fn get_workspace_present_photo_ids(workspace_id: i64) -> Result<Vec<i64>, String> {
+    with_db(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id
+             FROM photos
+             WHERE workspace_id = ?1 AND is_missing = 0",
+        )?;
+
+        let list = stmt
+            .query_map(params![workspace_id], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(list)
+    })
+    .map_err(|e| e.to_string())
+}
+
+pub fn sync_created_files(workspace_id: i64, workspace_path: &str, paths: &[String]) -> Result<usize, String> {
+    let root = PathBuf::from(workspace_path);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut dedup = HashSet::<String>::new();
+
+    for raw_path in paths {
+        let path = PathBuf::from(raw_path);
+        if path.is_file() {
+            if !is_image(&path) {
+                continue;
+            }
+            let key = path.to_string_lossy().to_string();
+            if dedup.insert(key) {
+                candidates.push(path);
+            }
+            continue;
+        }
+        if path.is_dir() {
+            for entry in WalkDir::new(&path)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file() && is_image(e.path()))
+            {
+                let file = entry.path().to_path_buf();
+                let key = file.to_string_lossy().to_string();
+                if dedup.insert(key) {
+                    candidates.push(file);
+                }
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    let mut synced = 0usize;
+    with_db_mut(|conn| {
+        let tx = conn.transaction()?;
+        for full_path in &candidates {
+            let Some(relative) = normalize_relative_path(&root, full_path) else {
+                continue;
+            };
+            let filename = full_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let (file_size, file_modified_at) = metadata_signature(full_path);
+            let (taken_at, camera_make, camera_model, lens_model, shutter_speed, aperture, iso, focal_length, width, height) =
+                read_exif_data(full_path);
+
+            tx.execute(
+                "INSERT OR IGNORE INTO photos
+                 (workspace_id, relative_path, filename, file_size, width, height,
+                  taken_at, camera_make, camera_model, lens_model, shutter_speed,
+                  aperture, iso, focal_length, file_modified_at, is_missing)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,0)",
+                params![
+                    workspace_id,
+                    relative,
+                    filename,
+                    file_size,
+                    width,
+                    height,
+                    taken_at,
+                    camera_make,
+                    camera_model,
+                    lens_model,
+                    shutter_speed,
+                    aperture,
+                    iso,
+                    focal_length,
+                    file_modified_at
+                ],
+            )?;
+            tx.execute(
+                "UPDATE photos
+                 SET filename=?1, file_size=?2, width=?3, height=?4,
+                     taken_at=?5, camera_make=?6, camera_model=?7, lens_model=?8,
+                     shutter_speed=?9, aperture=?10, iso=?11, focal_length=?12,
+                     file_modified_at=?13, is_missing=0
+                 WHERE workspace_id=?14 AND relative_path=?15",
+                params![
+                    filename,
+                    file_size,
+                    width,
+                    height,
+                    taken_at,
+                    camera_make,
+                    camera_model,
+                    lens_model,
+                    shutter_speed,
+                    aperture,
+                    iso,
+                    focal_length,
+                    file_modified_at,
+                    workspace_id,
+                    relative
+                ],
+            )?;
+            synced += 1;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .map_err(|e| e.to_string())?;
+
+    Ok(synced)
+}
+
+pub fn sync_removed_files(workspace_id: i64, workspace_path: &str, paths: &[String]) -> Result<usize, String> {
+    let root = PathBuf::from(workspace_path);
+    let mut file_paths: HashSet<String> = HashSet::new();
+    let mut folder_prefixes: HashSet<String> = HashSet::new();
+
+    for raw_path in paths {
+        let path = PathBuf::from(raw_path);
+        let Some(relative) = normalize_relative_path(&root, &path) else {
+            continue;
+        };
+        if is_image(&path) {
+            file_paths.insert(relative);
+        } else {
+            folder_prefixes.insert(relative);
+        }
+    }
+
+    if file_paths.is_empty() && folder_prefixes.is_empty() {
+        return Ok(0);
+    }
+
+    let mut synced = 0usize;
+    with_db_mut(|conn| {
+        let tx = conn.transaction()?;
+        for rel in &file_paths {
+            let changed = tx.execute(
+                "UPDATE photos SET is_missing=1 WHERE workspace_id=?1 AND relative_path=?2",
+                params![workspace_id, rel],
+            )?;
+            synced += changed;
+        }
+        for folder in &folder_prefixes {
+            let prefix = folder.trim_matches('/');
+            if prefix.is_empty() {
+                continue;
+            }
+            let like = format!("{prefix}/%");
+            let changed = tx.execute(
+                "UPDATE photos SET is_missing=1 WHERE workspace_id=?1 AND relative_path LIKE ?2",
+                params![workspace_id, like],
+            )?;
+            synced += changed;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .map_err(|e| e.to_string())?;
+
+    Ok(synced)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExistingPhotoState, ScanAction, decide_scan_action};
+
+    fn existing(file_modified_at: Option<&str>, file_size: Option<i64>, is_missing: bool) -> ExistingPhotoState {
+        ExistingPhotoState {
+            file_modified_at: file_modified_at.map(|v| v.to_string()),
+            file_size,
+            is_missing,
+        }
+    }
+
+    #[test]
+    fn decide_scan_action_skips_unchanged_non_missing_file() {
+        let current_modified = Some("2026-03-09T01:02:03Z".to_string());
+        let current_size = Some(1234_i64);
+        let state = existing(Some("2026-03-09T01:02:03Z"), Some(1234), false);
+
+        let action = decide_scan_action(Some(&state), &current_modified, &current_size);
+
+        assert_eq!(action, ScanAction::Skip);
+    }
+
+    #[test]
+    fn decide_scan_action_revives_unchanged_missing_file() {
+        let current_modified = Some("2026-03-09T01:02:03Z".to_string());
+        let current_size = Some(1234_i64);
+        let state = existing(Some("2026-03-09T01:02:03Z"), Some(1234), true);
+
+        let action = decide_scan_action(Some(&state), &current_modified, &current_size);
+
+        assert_eq!(action, ScanAction::Revive);
+    }
+
+    #[test]
+    fn decide_scan_action_rescans_when_metadata_changed() {
+        let current_modified = Some("2026-03-09T01:02:04Z".to_string());
+        let current_size = Some(1234_i64);
+        let state = existing(Some("2026-03-09T01:02:03Z"), Some(1234), false);
+
+        let action = decide_scan_action(Some(&state), &current_modified, &current_size);
+
+        assert_eq!(action, ScanAction::Rescan);
+    }
+
+    #[test]
+    fn decide_scan_action_rescans_new_file() {
+        let current_modified = Some("2026-03-09T01:02:03Z".to_string());
+        let current_size = Some(1234_i64);
+
+        let action = decide_scan_action(None, &current_modified, &current_size);
+
+        assert_eq!(action, ScanAction::Rescan);
+    }
 }

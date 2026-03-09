@@ -1,18 +1,79 @@
 use std::path::{Path, PathBuf};
 use std::io::BufWriter;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
+use std::time::UNIX_EPOCH;
 use image::{DynamicImage, imageops::FilterType};
 use crate::models::ExportOptions;
 use crate::db::with_db;
 use rusqlite::params;
 
 pub fn generate_thumbnail(photo_path: &str, size: u32) -> Result<Vec<u8>, String> {
+    let cache_path = resolve_thumbnail_cache_path(photo_path, size);
+    if let Some(path) = cache_path.as_ref() {
+        if let Some(bytes) = try_read_cached_thumbnail(path) {
+            return Ok(bytes);
+        }
+    }
+
     let img = image::open(photo_path).map_err(|e| e.to_string())?;
     let thumb = img.thumbnail(size, size);
     let mut buf = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut buf);
     thumb.write_to(&mut cursor, image::ImageFormat::Jpeg)
         .map_err(|e| e.to_string())?;
+
+    if let Some(path) = cache_path.as_ref() {
+        write_cached_thumbnail(path, &buf);
+    }
+
     Ok(buf)
+}
+
+fn resolve_thumbnail_cache_path(photo_path: &str, size: u32) -> Option<PathBuf> {
+    let root = thumbnail_cache_root()?;
+    let metadata = std::fs::metadata(photo_path).ok()?;
+    let file_len = metadata.len();
+    let modified_ns = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let key = build_cache_key(photo_path, size, file_len, modified_ns);
+    let shard = &key[0..2];
+    Some(root.join(shard).join(format!("{key}.jpg")))
+}
+
+fn thumbnail_cache_root() -> Option<PathBuf> {
+    dirs_next::data_local_dir().map(|d| d.join("myphoto").join("thumb_cache"))
+}
+
+fn try_read_cached_thumbnail(cache_path: &Path) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(cache_path).ok()?;
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(bytes)
+    }
+}
+
+fn write_cached_thumbnail(cache_path: &Path, bytes: &[u8]) {
+    if let Some(parent) = cache_path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let _ = std::fs::write(cache_path, bytes);
+}
+
+fn build_cache_key(photo_path: &str, size: u32, file_len: u64, modified_ns: u128) -> String {
+    let mut hasher = DefaultHasher::new();
+    photo_path.hash(&mut hasher);
+    size.hash(&mut hasher);
+    file_len.hash(&mut hasher);
+    modified_ns.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 pub fn export_photos(
@@ -155,4 +216,28 @@ fn save_image(img: &DynamicImage, path: &Path, format: &str, quality: u8) -> Res
         }
     }
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_cache_key;
+
+    #[test]
+    fn build_cache_key_is_stable_for_same_signature() {
+        let k1 = build_cache_key("C:/photos/a.jpg", 1600, 1234, 42);
+        let k2 = build_cache_key("C:/photos/a.jpg", 1600, 1234, 42);
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn build_cache_key_changes_when_signature_changes() {
+        let base = build_cache_key("C:/photos/a.jpg", 1600, 1234, 42);
+        let by_size = build_cache_key("C:/photos/a.jpg", 1800, 1234, 42);
+        let by_len = build_cache_key("C:/photos/a.jpg", 1600, 9999, 42);
+        let by_mtime = build_cache_key("C:/photos/a.jpg", 1600, 1234, 43);
+
+        assert_ne!(base, by_size);
+        assert_ne!(base, by_len);
+        assert_ne!(base, by_mtime);
+    }
 }

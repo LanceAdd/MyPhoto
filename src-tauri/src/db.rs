@@ -129,3 +129,12 @@ where
     let conn = guard.as_ref().expect("DB not initialized");
     f(conn)
 }
+
+pub fn with_db_mut<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce(&mut Connection) -> Result<T>,
+{
+    let mut guard = DB.lock().unwrap();
+    let conn = guard.as_mut().expect("DB not initialized");
+    f(conn)
+}
