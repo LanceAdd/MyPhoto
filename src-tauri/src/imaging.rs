@@ -7,7 +7,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Instant, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 #[derive(Clone, Debug)]
@@ -24,6 +25,63 @@ pub struct PreviewCacheInfo {
     pub path: String,
     pub size_bytes: u64,
     pub profile_sizes: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct ThumbnailPerfStats {
+    pub generated: u64,
+    pub cache_hits: u64,
+    pub decode_ms_total: u64,
+    pub resize_ms_total: u64,
+    pub encode_ms_total: u64,
+    pub io_ms_total: u64,
+}
+
+fn thumb_perf_stats() -> &'static Mutex<ThumbnailPerfStats> {
+    static STATS: OnceLock<Mutex<ThumbnailPerfStats>> = OnceLock::new();
+    STATS.get_or_init(|| Mutex::new(ThumbnailPerfStats::default()))
+}
+
+fn u128_to_u64_saturating(value: u128) -> u64 {
+    if value > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        value as u64
+    }
+}
+
+fn record_thumb_cache_hit(io_ms: u128) {
+    if let Ok(mut stats) = thumb_perf_stats().lock() {
+        stats.cache_hits = stats.cache_hits.saturating_add(1);
+        stats.io_ms_total = stats
+            .io_ms_total
+            .saturating_add(u128_to_u64_saturating(io_ms));
+    }
+}
+
+fn record_thumb_generated(decode_ms: u128, resize_ms: u128, encode_ms: u128, io_ms: u128) {
+    if let Ok(mut stats) = thumb_perf_stats().lock() {
+        stats.generated = stats.generated.saturating_add(1);
+        stats.decode_ms_total = stats
+            .decode_ms_total
+            .saturating_add(u128_to_u64_saturating(decode_ms));
+        stats.resize_ms_total = stats
+            .resize_ms_total
+            .saturating_add(u128_to_u64_saturating(resize_ms));
+        stats.encode_ms_total = stats
+            .encode_ms_total
+            .saturating_add(u128_to_u64_saturating(encode_ms));
+        stats.io_ms_total = stats
+            .io_ms_total
+            .saturating_add(u128_to_u64_saturating(io_ms));
+    }
+}
+
+pub fn get_thumbnail_perf_stats() -> ThumbnailPerfStats {
+    thumb_perf_stats()
+        .lock()
+        .map(|stats| stats.clone())
+        .unwrap_or_default()
 }
 
 pub fn ensure_preview_cache_path(
@@ -189,23 +247,37 @@ fn generate_thumbnail_with_profile(
 ) -> Result<Vec<u8>, String> {
     let cache_path = resolve_thumbnail_cache_path_v2(photo_path, size, profile, quality);
     if let Some(path) = cache_path.as_ref() {
+        let io_started = Instant::now();
         if let Some(bytes) = try_read_cached_thumbnail(path) {
+            record_thumb_cache_hit(io_started.elapsed().as_millis());
             return Ok(bytes);
         }
     }
 
+    let decode_started = Instant::now();
     let img = image::open(photo_path).map_err(|e| e.to_string())?;
+    let decode_ms = decode_started.elapsed().as_millis();
+
+    let resize_started = Instant::now();
     let thumb = img.thumbnail(size, size);
+    let resize_ms = resize_started.elapsed().as_millis();
+
+    let encode_started = Instant::now();
     let mut buf = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut buf);
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
     thumb
         .write_with_encoder(encoder)
         .map_err(|e| e.to_string())?;
+    let encode_ms = encode_started.elapsed().as_millis();
 
+    let io_started = Instant::now();
     if let Some(path) = cache_path.as_ref() {
         write_cached_thumbnail(path, &buf);
     }
+    let io_ms = io_started.elapsed().as_millis();
+
+    record_thumb_generated(decode_ms, resize_ms, encode_ms, io_ms);
 
     Ok(buf)
 }
@@ -447,6 +519,7 @@ fn save_image(img: &DynamicImage, path: &Path, format: &str, quality: u8) -> Res
 mod tests {
     use super::build_cache_key_v2;
     use super::ensure_preview_cache_path;
+    use super::get_thumbnail_perf_stats;
     use super::warmup_preview_cache_with_progress;
     use image::{ImageBuffer, Rgb};
     use rusqlite::params;
@@ -463,6 +536,15 @@ mod tests {
 
         assert_ne!(base, by_profile);
         assert_ne!(base, by_quality);
+    }
+
+    #[test]
+    fn thumbnail_perf_stats_is_serializable() {
+        let stats = get_thumbnail_perf_stats();
+        let json = serde_json::to_value(stats).expect("serialize perf stats");
+        assert!(json.get("generated").is_some());
+        assert!(json.get("cache_hits").is_some());
+        assert!(json.get("decode_ms_total").is_some());
     }
 
     #[test]
