@@ -44,13 +44,13 @@
         :style="{ transform: `translateY(${offsetY}px)` }"
       >
         <div
-          v-for="row in visibleRows"
-          :key="row[0]?.id"
+          v-for="entry in visibleRows"
+          :key="entry.rowIndex"
           class="grid-row"
-          :style="rowStyle(row)"
+          :style="rowStyle(entry.items)"
         >
           <PhotoCard
-            v-for="photo in row"
+            v-for="(photo, colIndex) in entry.items"
             :key="photo.id"
             :photo="photo"
             :size="cellSize"
@@ -58,6 +58,11 @@
             :selected="tab?.selectedIds.has(photo.id)"
             :active="tab?.activePhotoId === photo.id"
             :workspace-path="tab?.workspace.path ?? ''"
+            :grid-index="entry.rowIndex * cols + colIndex"
+            :visible-start="visibleStart"
+            :visible-end="visibleEnd"
+            :prefetch-start="prefetchStart"
+            :prefetch-end="prefetchEnd"
             @click="onPhotoClick($event, photo)"
             @dblclick="openLightbox(photo)"
             @contextmenu.prevent="onContextMenu($event, photo)"
@@ -128,9 +133,30 @@ const totalHeight = computed(() => rows.value.length * rowHeight.value)
 
 // Virtual scroll
 const viewportHeight = ref(600)
-const startRow = computed(() => Math.max(0, Math.floor(scrollTop.value / rowHeight.value) - 2))
-const endRow = computed(() => Math.min(rows.value.length, startRow.value + Math.ceil(viewportHeight.value / rowHeight.value) + 4))
-const visibleRows = computed(() => rows.value.slice(startRow.value, endRow.value))
+const viewportStartRow = computed(() => Math.max(0, Math.floor(scrollTop.value / rowHeight.value)))
+const viewportRowCount = computed(() => Math.max(1, Math.ceil(viewportHeight.value / rowHeight.value)))
+const viewportEndRow = computed(() => Math.min(rows.value.length, viewportStartRow.value + viewportRowCount.value))
+
+const visibleStart = computed(() => viewportStartRow.value * cols.value)
+const visibleEnd = computed(() => Math.min(photos.value.length, viewportEndRow.value * cols.value))
+const prefetchStart = computed(() => Math.max(0, (viewportStartRow.value - viewportRowCount.value) * cols.value))
+const prefetchEnd = computed(() => Math.min(
+  photos.value.length,
+  (viewportEndRow.value + viewportRowCount.value) * cols.value,
+))
+
+const startRow = computed(() => Math.max(0, viewportStartRow.value - 2))
+const endRow = computed(() => Math.min(rows.value.length, viewportEndRow.value + 2))
+const visibleRows = computed(() => {
+  const items: Array<{ rowIndex: number; items: Photo[] }> = []
+  for (let rowIndex = startRow.value; rowIndex < endRow.value; rowIndex++) {
+    items.push({
+      rowIndex,
+      items: rows.value[rowIndex] ?? [],
+    })
+  }
+  return items
+})
 const offsetY = computed(() => startRow.value * rowHeight.value)
 
 function rowStyle(row: Photo[]) {
@@ -444,5 +470,4 @@ onUnmounted(() => resizeObserver?.disconnect())
 .empty p { font-size: 14px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 </style>
-
 

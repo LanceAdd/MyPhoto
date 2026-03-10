@@ -34,7 +34,7 @@ async function load() {
     return
   }
   try {
-    const { size: normalizedSize, src } = await ensureGridThumbSrc(fullPath, requestSize)
+    const { size: normalizedSize, src } = await ensureGridThumbSrc(fullPath, requestSize, { priority: 'p1' })
     thumbSrc.value = src
     putCachedThumb(fullPath, normalizedSize, src)
   } catch { thumbSrc.value = null }

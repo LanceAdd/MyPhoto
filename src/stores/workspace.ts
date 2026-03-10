@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { readWarmupSettings } from '../utils/warmup-settings'
+import { hasActiveGridDemand, trimLowPriorityThumbTasks } from '../utils/thumb-loader'
 
 export interface Workspace {
   id: number
@@ -107,6 +108,7 @@ const PREVIEW_WARMUP_PROFILE = 'preview'
 const PREVIEW_WARMUP_QUALITY = 82
 const WARMUP_ACTIVITY_DEBOUNCE_MS = 1800
 const WARMUP_PAUSE_POLL_MS = 450
+const GRID_CANCEL_DEBOUNCE_MS = 1000
 
 function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -125,6 +127,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const fileEventFlushTimerByWorkspace = new Map<number, number>()
   const warmupTokensByWorkspace = new Map<number, { cancelled: boolean }>()
   const recentUiActivityAtByWorkspace = new Map<number, number>()
+  const recentGridTrimAtByWorkspace = new Map<number, number>()
   let activityListenersBound = false
 
   const activeTab = computed(() => tabs.value[activeTabIndex.value] ?? null)
@@ -154,6 +157,15 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     if (!tab) return false
     if (tab.scanning) return true
     if (activeTab.value?.workspace.id !== workspaceId) return false
+    if (hasActiveGridDemand()) {
+      const now = Date.now()
+      const lastTrim = recentGridTrimAtByWorkspace.get(workspaceId) ?? 0
+      if (now - lastTrim >= GRID_CANCEL_DEBOUNCE_MS) {
+        trimLowPriorityThumbTasks()
+        recentGridTrimAtByWorkspace.set(workspaceId, now)
+      }
+      return true
+    }
     const lastActiveAt = recentUiActivityAtByWorkspace.get(workspaceId) ?? 0
     return Date.now() - lastActiveAt < WARMUP_ACTIVITY_DEBOUNCE_MS
   }
@@ -323,6 +335,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         pendingCreatedPathsByWorkspace.delete(wsId)
         pendingRemovedPathsByWorkspace.delete(wsId)
         recentUiActivityAtByWorkspace.delete(wsId)
+        recentGridTrimAtByWorkspace.delete(wsId)
         const timer = fileEventFlushTimerByWorkspace.get(wsId)
         if (timer != null) {
           window.clearTimeout(timer)

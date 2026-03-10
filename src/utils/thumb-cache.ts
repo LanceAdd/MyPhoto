@@ -1,6 +1,6 @@
 const MAX_PHOTOS = 800
-const MAX_SIZES_PER_PHOTO = 4
-const SIZE_PRESETS = [160, 256, 384, 512]
+const MAX_SIZES_PER_PHOTO = 2
+const SIZE_PRESETS = [256, 512]
 
 type SizeMap = Map<number, string>
 

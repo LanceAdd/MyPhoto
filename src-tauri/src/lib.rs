@@ -186,6 +186,11 @@ async fn get_preview_cache_info() -> Result<imaging::PreviewCacheInfo, String> {
 }
 
 #[tauri::command]
+async fn get_thumbnail_perf_stats() -> Result<imaging::ThumbnailPerfStats, String> {
+    Ok(imaging::get_thumbnail_perf_stats())
+}
+
+#[tauri::command]
 async fn update_photo_meta(
     photo_id: i64,
     star_rating: i64,
@@ -557,6 +562,7 @@ pub fn run() {
             warmup_previews,
             rebuild_preview_cache,
             get_preview_cache_info,
+            get_thumbnail_perf_stats,
             update_photo_meta,
             batch_update_meta,
             export_photos,
