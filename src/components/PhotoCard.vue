@@ -59,7 +59,7 @@ import {
   normalizeThumbSize,
   putCachedThumb,
 } from '../utils/thumb-cache'
-import { ensureGridThumbSrc } from '../utils/thumb-loader'
+import { ensureGridThumbSrc, type EnsureGridThumbOptions } from '../utils/thumb-loader'
 
 const props = defineProps<{
   photo: Photo
@@ -68,11 +68,17 @@ const props = defineProps<{
   selected: boolean
   active: boolean
   workspacePath: string
+  gridIndex: number
+  visibleStart: number
+  visibleEnd: number
+  prefetchStart: number
+  prefetchEnd: number
 }>()
 const emit = defineEmits(['click', 'dblclick', 'contextmenu'])
 
 const store = useWorkspaceStore()
 const thumbSrc = ref<string | null>(null)
+const loadSeq = ref(0)
 
 const colorMap: Record<string, string> = {
   red: '#e74c3c',
@@ -102,30 +108,58 @@ const imgStyle = computed(() => {
 })
 
 async function loadThumb() {
+  const seq = ++loadSeq.value
   if (props.photo.is_missing) return
   const fullPath = `${props.workspacePath}/${props.photo.relative_path}`
   const requestSize = normalizeThumbSize(props.size * 2)
 
   const nearest = getNearestCachedThumb(fullPath, requestSize)
-  if (nearest && thumbSrc.value !== nearest) {
+  if (nearest && thumbSrc.value !== nearest && seq === loadSeq.value) {
     thumbSrc.value = nearest
   }
 
   const exact = getExactCachedThumb(fullPath, requestSize)
   if (exact) {
-    thumbSrc.value = exact
+    if (seq === loadSeq.value) thumbSrc.value = exact
     return
   }
 
+  const priority = resolvePriority()
+  const fastOptions: EnsureGridThumbOptions = { priority, phase: 'fast' }
   try {
-    const { size: normalizedSize, src } = await ensureGridThumbSrc(fullPath, requestSize)
+    const { size: normalizedSize, src } = await ensureGridThumbSrc(fullPath, requestSize, fastOptions)
+    if (seq !== loadSeq.value) return
     thumbSrc.value = src
     putCachedThumb(fullPath, normalizedSize, src)
+
+    if (requestSize > normalizedSize) {
+      const finalOptions: EnsureGridThumbOptions = {
+        priority: resolveUpgradePriority(priority),
+        phase: 'final',
+      }
+      const final = await ensureGridThumbSrc(fullPath, requestSize, finalOptions)
+      if (seq !== loadSeq.value) return
+      thumbSrc.value = final.src
+      putCachedThumb(fullPath, final.size, final.src)
+    }
   } catch (e) {
-    if (!thumbSrc.value) {
+    if (!thumbSrc.value && seq === loadSeq.value) {
       thumbSrc.value = null
     }
   }
+}
+
+function resolvePriority() {
+  const idx = props.gridIndex
+  if (idx >= props.visibleStart && idx < props.visibleEnd) return 'p0' as const
+  if (idx >= props.prefetchStart && idx < props.prefetchEnd) return 'p1' as const
+  return 'p3' as const
+}
+
+function resolveUpgradePriority(priority: 'p0' | 'p1' | 'p3') {
+  if (priority === 'p0') return 'p2' as const
+  if (priority === 'p1') return 'p3' as const
+  return 'p4' as const
 }
 
 function setStar(n: number) {
@@ -147,6 +181,7 @@ onMounted(() => {
 
 watch(() => props.photo.relative_path, loadThumb)
 watch(() => props.workspacePath, loadThumb)
+watch(() => props.size, loadThumb)
 </script>
 
 <style scoped>
