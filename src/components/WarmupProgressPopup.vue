@@ -1,4 +1,4 @@
-﻿<template>
+<template>
   <div v-if="visible && tab" class="warmup-popup" :class="{ minimized }">
     <div class="popup-header">
       <div class="title-wrap">
@@ -13,17 +13,20 @@
     </div>
 
     <div class="progress-row">
-      <div class="numbers">{{ done }} / {{ total }}</div>
+      <div class="row-head">
+        <span class="row-title">缩略图总进度（网格+选片）</span>
+        <span class="numbers">{{ done }} / {{ total }}</span>
+      </div>
       <div class="bar">
         <div class="fill" :style="{ width: percent + '%' }" />
       </div>
     </div>
 
     <div v-if="!minimized" class="content">
-      <div class="current" :title="currentFile">{{ currentFile || '正在准备下一批文件...' }}</div>
+      <div class="current" :title="currentFile">{{ currentFile || '缩略图预热空闲中' }}</div>
       <p>系统已根据设备性能自动计算首批预热数量：{{ initialLimit }} 张。</p>
       <p>当前使用 {{ workerConcurrency }} 条线程自动预热，预热已自动开始。</p>
-      <p>当前显示的是完整预热进度（含首批与后台阶段）。</p>
+      <p>当前进度条为统一进度：每张图会在一次处理中同时生成网格与选片缓存。</p>
       <p>预热会提前生成缩略图与预览缓存，首次加载稍慢，完成后浏览和切换会更快。</p>
       <p>你可以关闭弹窗，预热仍会在后台继续运行。</p>
     </div>
@@ -156,6 +159,19 @@ function closePopup() {
 
 .progress-row {
   padding: 0 12px 12px;
+}
+
+.row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.row-title {
+  font-size: 12px;
+  color: #d4dde9;
 }
 
 .numbers {

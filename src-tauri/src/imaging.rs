@@ -114,12 +114,70 @@ pub fn ensure_preview_cache_path(
     Ok(cache_path.to_string_lossy().to_string())
 }
 
+pub fn ensure_preview_cache_path_with_secondary(
+    photo_path: &str,
+    size: u32,
+    profile: &str,
+    quality: u8,
+    secondary_size: Option<u32>,
+    secondary_profile: Option<&str>,
+    secondary_quality: Option<u8>,
+) -> Result<String, String> {
+    if secondary_size.is_none() || secondary_profile.is_none() || secondary_quality.is_none() {
+        return ensure_preview_cache_path(photo_path, size, profile, quality);
+    }
+
+    let profile = normalize_profile(profile);
+    let quality = normalize_quality(quality);
+    let secondary_variant =
+        match (secondary_size, secondary_profile, secondary_quality) {
+            (Some(sec_size), Some(sec_profile), Some(sec_quality)) => {
+                let normalized_profile = normalize_profile(sec_profile);
+                let normalized_quality = normalize_quality(sec_quality);
+                if sec_size == size
+                    && normalized_profile == profile
+                    && normalized_quality == quality
+                {
+                    None
+                } else {
+                    Some((sec_size, normalized_profile, normalized_quality))
+                }
+            }
+            _ => None,
+        };
+    let cache_path = resolve_thumbnail_cache_path_v2(photo_path, size, &profile, quality)
+        .ok_or_else(|| "failed to resolve preview cache path".to_string())?;
+
+    if !cache_path.exists() {
+        ensure_warmup_cache_variants_for_photo(
+            photo_path,
+            size,
+            &profile,
+            quality,
+            secondary_variant
+                .as_ref()
+                .map(|(sec_size, sec_profile, sec_quality)| {
+                    (*sec_size, sec_profile.as_str(), *sec_quality)
+                }),
+        )?;
+    }
+
+    if !cache_path.exists() {
+        return Err("failed to persist preview cache".to_string());
+    }
+
+    Ok(cache_path.to_string_lossy().to_string())
+}
+
 pub fn warmup_preview_cache_with_progress<F>(
     workspace_id: i64,
     workspace_path: &str,
     size: u32,
     profile: &str,
     quality: u8,
+    secondary_size: Option<u32>,
+    secondary_profile: Option<&str>,
+    secondary_quality: Option<u8>,
     offset: usize,
     limit: usize,
     concurrency: usize,
@@ -156,11 +214,31 @@ where
         return Ok(0);
     }
 
+    let primary_profile = normalize_profile(profile);
+    let primary_quality = normalize_quality(quality);
+    let secondary_variant =
+        match (secondary_size, secondary_profile.as_deref(), secondary_quality) {
+            (Some(sec_size), Some(sec_profile), Some(sec_quality)) => {
+                let normalized_profile = normalize_profile(sec_profile);
+                let normalized_quality = normalize_quality(sec_quality);
+                if sec_size == size
+                    && normalized_profile == primary_profile
+                    && normalized_quality == primary_quality
+                {
+                    None
+                } else {
+                    Some((sec_size, normalized_profile, normalized_quality))
+                }
+            }
+            _ => None,
+        };
+
     let worker_count = normalize_warmup_concurrency(concurrency).min(total.max(1));
     let files = Arc::new(files);
     let next_idx = Arc::new(AtomicUsize::new(0));
     let workspace_path_owned = workspace_path.to_string();
-    let profile_owned = profile.to_string();
+    let primary_profile_owned = primary_profile.clone();
+    let secondary_variant_owned = secondary_variant.clone();
     let (result_tx, result_rx) = std::sync::mpsc::channel::<(bool, String)>();
 
     for _ in 0..worker_count {
@@ -168,7 +246,8 @@ where
         let next_idx_ref = Arc::clone(&next_idx);
         let tx_ref = result_tx.clone();
         let workspace_path_ref = workspace_path_owned.clone();
-        let profile_ref = profile_owned.clone();
+        let primary_profile_ref = primary_profile_owned.clone();
+        let secondary_variant_ref = secondary_variant_owned.clone();
         std::thread::spawn(move || {
             loop {
                 let idx = next_idx_ref.fetch_add(1, Ordering::Relaxed);
@@ -177,9 +256,16 @@ where
                 }
                 let file = &files_ref[idx];
                 let full = PathBuf::from(&workspace_path_ref).join(&file.relative_path);
-                let ok =
-                    ensure_preview_cache_path(full.to_string_lossy().as_ref(), size, &profile_ref, quality)
-                        .is_ok();
+                let ok = ensure_warmup_cache_variants_for_photo(
+                    full.to_string_lossy().as_ref(),
+                    size,
+                    &primary_profile_ref,
+                    primary_quality,
+                    secondary_variant_ref.as_ref().map(|(sec_size, sec_profile, sec_quality)| {
+                        (*sec_size, sec_profile.as_str(), *sec_quality)
+                    }),
+                )
+                .is_ok();
                 let _ = tx_ref.send((ok, file.filename.clone()));
             }
         });
@@ -223,9 +309,29 @@ fn resolve_thumbnail_cache_path_v2(
         .duration_since(UNIX_EPOCH)
         .ok()?
         .as_nanos();
+    Some(resolve_thumbnail_cache_path_v2_with_signature(
+        &root,
+        photo_path,
+        size,
+        profile,
+        quality,
+        file_len,
+        modified_ns,
+    ))
+}
+
+fn resolve_thumbnail_cache_path_v2_with_signature(
+    root: &Path,
+    photo_path: &str,
+    size: u32,
+    profile: &str,
+    quality: u8,
+    file_len: u64,
+    modified_ns: u128,
+) -> PathBuf {
     let key = build_cache_key_v2(photo_path, size, file_len, modified_ns, profile, quality);
     let shard = &key[0..2];
-    Some(root.join(profile).join(shard).join(format!("{key}.jpg")))
+    root.join(profile).join(shard).join(format!("{key}.jpg"))
 }
 
 fn thumbnail_cache_root() -> Option<PathBuf> {
@@ -315,6 +421,117 @@ fn generate_thumbnail_with_profile(
     record_thumb_generated(decode_ms, resize_ms, encode_ms, io_ms);
 
     Ok(buf)
+}
+
+fn ensure_warmup_cache_variants_for_photo(
+    photo_path: &str,
+    size: u32,
+    profile: &str,
+    quality: u8,
+    secondary: Option<(u32, &str, u8)>,
+) -> Result<(), String> {
+    let cache_root = thumbnail_cache_root().ok_or_else(|| "cache root unavailable".to_string())?;
+    let metadata = std::fs::metadata(photo_path).map_err(|e| e.to_string())?;
+    let file_len = metadata.len();
+    let modified_ns = metadata
+        .modified()
+        .map_err(|e| e.to_string())?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+
+    let primary_path = resolve_thumbnail_cache_path_v2_with_signature(
+        &cache_root,
+        photo_path,
+        size,
+        profile,
+        quality,
+        file_len,
+        modified_ns,
+    );
+    let primary_missing = !primary_path.exists();
+
+    let secondary_path = secondary.map(|(sec_size, sec_profile, sec_quality)| {
+        (
+            sec_size,
+            sec_quality,
+            resolve_thumbnail_cache_path_v2_with_signature(
+                &cache_root,
+                photo_path,
+                sec_size,
+                sec_profile,
+                sec_quality,
+                file_len,
+                modified_ns,
+            ),
+        )
+    });
+    let secondary_missing = secondary_path
+        .as_ref()
+        .map(|(_, _, path)| !path.exists())
+        .unwrap_or(false);
+
+    if !primary_missing && !secondary_missing {
+        return Ok(());
+    }
+
+    let decode_started = Instant::now();
+    let img = image::open(photo_path).map_err(|e| e.to_string())?;
+    let decode_ms = decode_started.elapsed().as_millis();
+    let mut decode_recorded = false;
+
+    if primary_missing {
+        write_variant_from_decoded_image(
+            &img,
+            &primary_path,
+            size,
+            quality,
+            if decode_recorded { 0 } else { decode_ms },
+        )?;
+        decode_recorded = true;
+    }
+    if secondary_missing {
+        if let Some((sec_size, sec_quality, sec_path)) = secondary_path.as_ref() {
+            write_variant_from_decoded_image(
+                &img,
+                sec_path,
+                *sec_size,
+                *sec_quality,
+                if decode_recorded { 0 } else { decode_ms },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn write_variant_from_decoded_image(
+    img: &DynamicImage,
+    cache_path: &Path,
+    size: u32,
+    quality: u8,
+    decode_ms: u128,
+) -> Result<(), String> {
+    let resize_started = Instant::now();
+    let thumb = img.thumbnail(size, size);
+    let resize_ms = resize_started.elapsed().as_millis();
+
+    let encode_started = Instant::now();
+    let mut buf = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut buf);
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
+    thumb
+        .write_with_encoder(encoder)
+        .map_err(|e| e.to_string())?;
+    let encode_ms = encode_started.elapsed().as_millis();
+
+    let io_started = Instant::now();
+    write_cached_thumbnail(cache_path, &buf);
+    if !cache_path.exists() {
+        return Err("failed to write warmup cache file".to_string());
+    }
+    let io_ms = io_started.elapsed().as_millis();
+    record_thumb_generated(decode_ms, resize_ms, encode_ms, io_ms);
+    Ok(())
 }
 
 fn normalize_profile(profile: &str) -> String {
@@ -696,6 +913,9 @@ mod tests {
             1200,
             "preview",
             82,
+            None,
+            None,
+            None,
             0,
             2,
             2,
@@ -732,6 +952,9 @@ mod tests {
             1200,
             "preview",
             82,
+            None,
+            None,
+            None,
             0,
             2,
             2,
@@ -745,6 +968,43 @@ mod tests {
         assert!(!steps.is_empty());
         assert_eq!(steps.first().copied(), Some((0, 2, false)));
         assert_eq!(steps.last().copied(), Some((2, 2, true)));
+
+        cleanup_workspace_from_db(workspace_id);
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(cache_root);
+        std::env::remove_var("MYPHOTO_THUMB_CACHE_ROOT");
+    }
+
+    #[test]
+    fn warmup_generates_primary_and_secondary_caches_together() {
+        let _guard = cache_env_lock().lock().expect("cache env lock");
+        let cache_root = create_cache_root();
+        std::env::set_var(
+            "MYPHOTO_THUMB_CACHE_ROOT",
+            cache_root.to_string_lossy().as_ref(),
+        );
+        let workspace = create_temp_workspace_with_images(2);
+        let workspace_id = prepare_workspace_for_warmup(&workspace);
+
+        let warmed = warmup_preview_cache_with_progress(
+            workspace_id,
+            workspace.to_string_lossy().as_ref(),
+            1200,
+            "preview",
+            82,
+            Some(256),
+            Some("grid"),
+            Some(72),
+            0,
+            2,
+            2,
+            |_progress| {},
+        )
+        .expect("warmup with dual profiles should run");
+
+        assert_eq!(warmed, 2);
+        let generated = count_cached_jpegs(&cache_root);
+        assert_eq!(generated, 4);
 
         cleanup_workspace_from_db(workspace_id);
         let _ = std::fs::remove_dir_all(workspace);
@@ -892,6 +1152,9 @@ mod tests {
                 size,
                 profile,
                 quality,
+                None,
+                None,
+                None,
                 offset,
                 batch,
                 2,

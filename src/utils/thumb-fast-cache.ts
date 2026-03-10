@@ -61,6 +61,29 @@ export function clearFastThumbCache() {
   fastCacheBytes = 0
 }
 
+function normalizePathPrefix(path: string) {
+  return path.replace(/\\/g, '/').replace(/\/+$/, '')
+}
+
+export function invalidateFastThumbCacheByPaths(paths: string[]) {
+  if (!paths.length) return
+  const normalized = paths
+    .map(normalizePathPrefix)
+    .filter(Boolean)
+  if (!normalized.length) return
+
+  for (const key of [...fastCache.keys()]) {
+    const keyPath = normalizePathPrefix(key.split('|')[0] ?? '')
+    const matched = normalized.some(prefix =>
+      keyPath === prefix || keyPath.startsWith(`${prefix}/`)
+    )
+    if (!matched) continue
+    const entry = fastCache.get(key)
+    fastCache.delete(key)
+    if (entry) fastCacheBytes = Math.max(0, fastCacheBytes - entry.bytes)
+  }
+}
+
 export function getFastThumbCacheStats() {
   return {
     entries: fastCache.size,
@@ -68,4 +91,3 @@ export function getFastThumbCacheStats() {
     maxBytes: fastCacheMaxBytes,
   }
 }
-

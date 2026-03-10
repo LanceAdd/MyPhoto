@@ -6,6 +6,10 @@ type SizeMap = Map<number, string>
 
 const cacheByPhoto = new Map<string, SizeMap>()
 
+function normalizePathPrefix(path: string) {
+  return path.replace(/\\/g, '/').replace(/\/+$/, '')
+}
+
 function touchPhoto(photoKey: string) {
   const found = cacheByPhoto.get(photoKey)
   if (!found) return
@@ -93,4 +97,22 @@ export function getNearestCachedThumb(photoKey: string, size: number): string | 
 
 export function clearThumbCache() {
   cacheByPhoto.clear()
+}
+
+export function invalidateThumbCacheByPaths(paths: string[]) {
+  if (!paths.length) return
+  const normalized = paths
+    .map(normalizePathPrefix)
+    .filter(Boolean)
+  if (!normalized.length) return
+
+  for (const photoKey of [...cacheByPhoto.keys()]) {
+    const key = normalizePathPrefix(photoKey)
+    const matched = normalized.some(prefix =>
+      key === prefix || key.startsWith(`${prefix}/`)
+    )
+    if (matched) {
+      cacheByPhoto.delete(photoKey)
+    }
+  }
 }

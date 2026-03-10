@@ -3,7 +3,11 @@ import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { readWarmupSettings } from '../utils/warmup-settings'
-import { hasActiveGridDemand, trimLowPriorityThumbTasks } from '../utils/thumb-loader'
+import {
+  hasActiveGridDemand,
+  invalidateGridThumbCachesByPaths,
+  trimLowPriorityThumbTasks,
+} from '../utils/thumb-loader'
 
 export interface Workspace {
   id: number
@@ -112,6 +116,9 @@ interface WarmupBatchContext {
 const PREVIEW_WARMUP_SIZE = 1600
 const PREVIEW_WARMUP_PROFILE = 'preview'
 const PREVIEW_WARMUP_QUALITY = 82
+const GRID_WARMUP_SIZE = 256
+const GRID_WARMUP_PROFILE = 'grid'
+const GRID_WARMUP_QUALITY = 72
 const WARMUP_ACTIVITY_DEBOUNCE_MS = 1800
 const WARMUP_PAUSE_POLL_MS = 450
 const GRID_CANCEL_DEBOUNCE_MS = 1000
@@ -130,6 +137,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const metaPresenceSyncInFlight = new Set<number>()
   const pendingCreatedPathsByWorkspace = new Map<number, Set<string>>()
   const pendingRemovedPathsByWorkspace = new Map<number, Set<string>>()
+  const pendingModifiedPathsByWorkspace = new Map<number, Set<string>>()
   const fileEventFlushTimerByWorkspace = new Map<number, number>()
   const warmupTokensByWorkspace = new Map<number, { cancelled: boolean }>()
   const warmupBatchContextByWorkspace = new Map<number, WarmupBatchContext>()
@@ -257,6 +265,9 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         size: PREVIEW_WARMUP_SIZE,
         profile: PREVIEW_WARMUP_PROFILE,
         quality: PREVIEW_WARMUP_QUALITY,
+        secondarySize: GRID_WARMUP_SIZE,
+        secondaryProfile: GRID_WARMUP_PROFILE,
+        secondaryQuality: GRID_WARMUP_QUALITY,
         offset,
         limit,
         concurrency,
@@ -443,6 +454,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         metaPresenceSyncInFlight.delete(wsId)
         pendingCreatedPathsByWorkspace.delete(wsId)
         pendingRemovedPathsByWorkspace.delete(wsId)
+        pendingModifiedPathsByWorkspace.delete(wsId)
         warmupBatchContextByWorkspace.delete(wsId)
         warmupTargetTotalByWorkspace.delete(wsId)
         recentUiActivityAtByWorkspace.delete(wsId)
@@ -629,6 +641,42 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     }
   }
 
+  function normalizeAbsolutePath(path: string) {
+    return path.replace(/\\/g, '/').replace(/\/+$/, '')
+  }
+
+  function isLikelyImagePath(path: string) {
+    return /\.(jpe?g|png|webp|gif|bmp|tiff?|heic|heif|avif|raw|dng|cr2|nef|arw)$/i.test(path)
+  }
+
+  async function warmupPreviewForAbsolutePaths(workspacePath: string, paths: string[]) {
+    if (!workspacePath) return
+    const settings = readWarmupSettings()
+    const concurrency = Math.max(1, Math.min(8, settings.workerConcurrency))
+    const normalized = [...new Set(paths.map(normalizeAbsolutePath))]
+      .filter(path => !!path && isLikelyImagePath(path))
+    if (normalized.length === 0) return
+
+    let cursor = 0
+    const worker = async () => {
+      while (true) {
+        const index = cursor++
+        if (index >= normalized.length) return
+        const photoPath = normalized[index]
+        await invoke('ensure_preview_cache', {
+          photoPath,
+          size: PREVIEW_WARMUP_SIZE,
+          profile: PREVIEW_WARMUP_PROFILE,
+          quality: PREVIEW_WARMUP_QUALITY,
+          secondarySize: GRID_WARMUP_SIZE,
+          secondaryProfile: GRID_WARMUP_PROFILE,
+          secondaryQuality: GRID_WARMUP_QUALITY,
+        }).catch(() => {})
+      }
+    }
+    await Promise.all(Array.from({ length: concurrency }, () => worker()))
+  }
+
   function scheduleFileEventFlush(workspaceId: number) {
     if (fileEventFlushTimerByWorkspace.has(workspaceId)) return
     const timer = window.setTimeout(() => {
@@ -643,33 +691,54 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     if (!tab) {
       pendingCreatedPathsByWorkspace.delete(workspaceId)
       pendingRemovedPathsByWorkspace.delete(workspaceId)
+      pendingModifiedPathsByWorkspace.delete(workspaceId)
       return
     }
 
     const created = [...(pendingCreatedPathsByWorkspace.get(workspaceId) ?? new Set<string>())]
     const removed = [...(pendingRemovedPathsByWorkspace.get(workspaceId) ?? new Set<string>())]
+    const modified = [...(pendingModifiedPathsByWorkspace.get(workspaceId) ?? new Set<string>())]
     pendingCreatedPathsByWorkspace.delete(workspaceId)
     pendingRemovedPathsByWorkspace.delete(workspaceId)
+    pendingModifiedPathsByWorkspace.delete(workspaceId)
 
-    if (created.length === 0 && removed.length === 0) return
+    if (created.length === 0 && removed.length === 0 && modified.length === 0) return
+
+    const createdNormalized = [...new Set(created.map(normalizeAbsolutePath).filter(Boolean))]
+    const removedNormalized = [...new Set(removed.map(normalizeAbsolutePath).filter(Boolean))]
+    const removedSet = new Set(removedNormalized)
+    const modifiedNormalized = [...new Set(modified.map(normalizeAbsolutePath).filter(Boolean))]
+      .filter(path => !removedSet.has(path))
 
     try {
-      if (removed.length > 0) {
+      if (removedNormalized.length > 0) {
         await invoke('sync_removed_files', {
           workspaceId,
           workspacePath: tab.workspace.path,
-          paths: removed,
+          paths: removedNormalized,
         })
       }
-      if (created.length > 0) {
+      if (createdNormalized.length > 0) {
         await invoke('sync_created_files', {
           workspaceId,
           workspacePath: tab.workspace.path,
-          paths: created,
+          paths: createdNormalized,
+        })
+      }
+      if (modifiedNormalized.length > 0) {
+        await invoke('sync_created_files', {
+          workspaceId,
+          workspacePath: tab.workspace.path,
+          paths: modifiedNormalized,
         })
       }
     } catch {
       // If partial sync fails, keep eventual consistency via scan-complete/rescan flow.
+    }
+
+    const invalidateTargets = [...removedNormalized, ...modifiedNormalized]
+    if (invalidateTargets.length > 0) {
+      invalidateGridThumbCachesByPaths(invalidateTargets)
     }
 
     const tabIndex = tabs.value.findIndex(t => t.workspace.id === workspaceId)
@@ -685,8 +754,9 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         currentTab.warmupTotal = latestCount
         currentTab.warmupDone = Math.max(0, Math.min(currentTab.warmupDone, latestCount))
       }
-      if (created.length > 0) {
-        void startWarmupPipeline(workspaceId, currentTab.workspace.path)
+      const previewWarmupTargets = [...createdNormalized, ...modifiedNormalized]
+      if (previewWarmupTargets.length > 0) {
+        void warmupPreviewForAbsolutePaths(currentTab.workspace.path, previewWarmupTargets)
       }
     }
   }
@@ -942,19 +1012,24 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     await listen<{ workspace_id: number; count: number }>('scan-complete', async (event) => {
       const tab = tabs.value.find(t => t.workspace.id === event.payload.workspace_id)
       if (tab) {
+        const previousTarget = warmupTargetTotalByWorkspace.get(tab.workspace.id) ?? 0
+        const nextCount = Math.max(0, event.payload.count ?? 0)
         tab.scanning = false
         tab.scanError = null
         tab.scanPhase = 'done'
         tab.scanDone = event.payload.count ?? tab.scanDone
         tab.scanTotal = event.payload.count ?? tab.scanTotal
         tab.scanCurrent = null
-        tab.workspace.photo_count = event.payload.count
-        warmupTargetTotalByWorkspace.set(tab.workspace.id, Math.max(0, event.payload.count ?? 0))
+        tab.workspace.photo_count = nextCount
+        warmupTargetTotalByWorkspace.set(tab.workspace.id, nextCount)
         await loadPhotos(tabs.value.indexOf(tab), { refreshMeta: true })
         await syncRemovedMetaCache(tab.workspace.id)
         await refreshSubfolders(tab)
         await refreshTreeFiles(tab)
-        void startWarmupPipeline(tab.workspace.id, tab.workspace.path)
+        const shouldRestartWarmup = previousTarget <= 0 || previousTarget !== nextCount
+        if (shouldRestartWarmup) {
+          void startWarmupPipeline(tab.workspace.id, tab.workspace.path)
+        }
       }
     })
 
@@ -992,6 +1067,14 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       const tab = tabs.value.find(t => t.workspace.id === event.payload.workspace_id)
       if (tab) {
         addPendingPaths(pendingCreatedPathsByWorkspace, tab.workspace.id, event.payload.paths)
+        scheduleFileEventFlush(tab.workspace.id)
+      }
+    })
+
+    await listen<{ workspace_id: number; paths: string[] }>('file-modified', async (event) => {
+      const tab = tabs.value.find(t => t.workspace.id === event.payload.workspace_id)
+      if (tab) {
+        addPendingPaths(pendingModifiedPathsByWorkspace, tab.workspace.id, event.payload.paths)
         scheduleFileEventFlush(tab.workspace.id)
       }
     })

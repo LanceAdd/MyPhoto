@@ -78,7 +78,7 @@ import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { NDropdown, NModal, NCard, NInput, NButton, useMessage } from 'naive-ui'
 import { useWorkspaceStore, type WorkspaceFile } from '../stores/workspace'
-import { clearGridThumbCaches } from '../utils/thumb-loader'
+import { clearGridThumbCaches, invalidateGridThumbCachesByPaths } from '../utils/thumb-loader'
 
 type ContextTargetType = 'root' | 'folder' | 'file'
 
@@ -491,26 +491,43 @@ async function doRename() {
   if (!t || !ctxTargetPath.value || ctxTargetType.value === 'root') return
 
   const oldFullPath = `${t.workspace.path}/${ctxTargetPath.value}`
-  const newAbsPath: string = await invoke('rename_entry', {
-    path: oldFullPath,
-    newName: renameValue.value,
-  })
+  try {
+    const newAbsPath: string = await invoke('rename_entry', {
+      path: oldFullPath,
+      newName: renameValue.value,
+    })
 
-  showRename.value = false
-  clearGridThumbCaches()
-  await refreshTreeData()
-  await requestRescan()
-  await store.loadPhotos()
+    showRename.value = false
+    invalidateGridThumbCachesByPaths([oldFullPath, newAbsPath])
 
-  const nextRelPath = toRelativePath(newAbsPath, t.workspace.path)
-  if (ctxTargetType.value === 'file') {
-    activeFile.value = nextRelPath
-    activeFolder.value = parentFolder(nextRelPath)
-  } else {
-    activeFolder.value = nextRelPath
-    activeFile.value = null
+    await Promise.all([
+      invoke('sync_removed_files', {
+        workspaceId: t.workspace.id,
+        workspacePath: t.workspace.path,
+        paths: [oldFullPath],
+      }),
+      invoke('sync_created_files', {
+        workspaceId: t.workspace.id,
+        workspacePath: t.workspace.path,
+        paths: [newAbsPath],
+      }),
+    ])
+
+    await refreshTreeData()
+    await store.loadPhotos(undefined, { refreshMeta: true })
+
+    const nextRelPath = toRelativePath(newAbsPath, t.workspace.path)
+    if (ctxTargetType.value === 'file') {
+      activeFile.value = nextRelPath
+      activeFolder.value = parentFolder(nextRelPath)
+    } else {
+      activeFolder.value = nextRelPath
+      activeFile.value = null
+    }
+    message.success(`${ctxTargetType.value === 'file' ? '文件' : '文件夹'}已重命名，相关缩略图将按变更路径增量重建`)
+  } catch (error) {
+    message.error(`重命名失败: ${String(error)}`)
   }
-  message.success(`${ctxTargetType.value === 'file' ? '文件' : '文件夹'}已重命名，将自动重新预热`)
 }
 
 async function doCreateFolder() {

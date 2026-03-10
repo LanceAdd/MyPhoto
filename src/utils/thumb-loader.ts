@@ -1,7 +1,13 @@
 import { invoke } from '@tauri-apps/api/core'
 import { toTauriImageSrc } from './image-src'
-import { clearThumbCache, normalizeThumbSize } from './thumb-cache'
-import { clearFastThumbCache, estimateThumbBytes, getFastThumb, putFastThumb } from './thumb-fast-cache'
+import { clearThumbCache, invalidateThumbCacheByPaths, normalizeThumbSize } from './thumb-cache'
+import {
+  clearFastThumbCache,
+  estimateThumbBytes,
+  getFastThumb,
+  invalidateFastThumbCacheByPaths,
+  putFastThumb,
+} from './thumb-fast-cache'
 import {
   cancelPendingThumbTasks,
   enqueueThumbTask,
@@ -136,6 +142,26 @@ export function clearGridThumbCaches() {
   clearThumbCache()
   clearFastThumbCache()
   cancelPendingThumbTasks(() => true)
+}
+
+function normalizeAbsolutePath(path: string) {
+  return path.replace(/\\/g, '/').replace(/\/+$/, '')
+}
+
+export function invalidateGridThumbCachesByPaths(paths: string[]) {
+  const normalized = paths
+    .map(normalizeAbsolutePath)
+    .filter(Boolean)
+  if (!normalized.length) return
+
+  invalidateThumbCacheByPaths(normalized)
+  invalidateFastThumbCacheByPaths(normalized)
+  cancelPendingThumbTasks((_, key) => {
+    const keyPath = normalizeAbsolutePath(key.split('|')[0] ?? '')
+    return normalized.some(prefix =>
+      keyPath === prefix || keyPath.startsWith(`${prefix}/`)
+    )
+  })
 }
 
 export function getGridThumbQueueStats() {

@@ -141,8 +141,19 @@ async fn ensure_preview_cache(
     size: u32,
     profile: String,
     quality: u8,
+    secondary_size: Option<u32>,
+    secondary_profile: Option<String>,
+    secondary_quality: Option<u8>,
 ) -> Result<String, String> {
-    imaging::ensure_preview_cache_path(&photo_path, size, &profile, quality)
+    imaging::ensure_preview_cache_path_with_secondary(
+        &photo_path,
+        size,
+        &profile,
+        quality,
+        secondary_size,
+        secondary_profile.as_deref(),
+        secondary_quality,
+    )
 }
 
 #[tauri::command]
@@ -152,6 +163,9 @@ async fn warmup_previews(
     size: u32,
     profile: String,
     quality: u8,
+    secondary_size: Option<u32>,
+    secondary_profile: Option<String>,
+    secondary_quality: Option<u8>,
     offset: usize,
     limit: usize,
     concurrency: usize,
@@ -163,6 +177,9 @@ async fn warmup_previews(
         size,
         &profile,
         quality,
+        secondary_size,
+        secondary_profile.as_deref(),
+        secondary_quality,
         offset,
         limit,
         concurrency,
