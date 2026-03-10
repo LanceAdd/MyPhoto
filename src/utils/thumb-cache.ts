@@ -90,3 +90,7 @@ export function getNearestCachedThumb(photoKey: string, size: number): string | 
   }
   return bestSrc
 }
+
+export function clearThumbCache() {
+  cacheByPhoto.clear()
+}

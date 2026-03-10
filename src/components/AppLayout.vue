@@ -95,6 +95,7 @@
     </div>
 
     <StatusBar v-if="store.activeTab" />
+    <WarmupProgressPopup v-if="store.activeTab" />
 
     <LightboxView v-if="lightboxPhoto" :photo="lightboxPhoto" @close="lightboxPhoto = null" />
     <HelpPanel v-if="showHelp" @close="showHelp = false" />
@@ -139,6 +140,8 @@ import LightboxView from './LightboxView.vue'
 import HelpPanel from './HelpPanel.vue'
 import SettingsPanel from './SettingsPanel.vue'
 import ExportDialog from './ExportDialog.vue'
+import WarmupProgressPopup from './WarmupProgressPopup.vue'
+import { ensureWarmupSettingsInitialized } from '../utils/warmup-settings'
 
 const store = useWorkspaceStore()
 const kbStore = useKeybindingStore()
@@ -331,6 +334,7 @@ function handleGlobalKey(e: KeyboardEvent) {
 }
 
 onMounted(async () => {
+  ensureWarmupSettingsInitialized()
   layoutRef.value?.focus()
   recentWorkspaces.value = await invoke('get_recent_workspaces')
 

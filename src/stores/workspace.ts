@@ -51,6 +51,7 @@ interface PhotoMetaEntry {
 
 export interface PhotoFilter {
   subfolder?: string
+  filename_contains?: string
   star_min?: number
   star_none?: boolean
   color_labels?: string[]
@@ -103,6 +104,11 @@ interface WarmupProgressPayload {
   finished: boolean
 }
 
+interface WarmupBatchContext {
+  baseDone: number
+  total: number
+}
+
 const PREVIEW_WARMUP_SIZE = 1600
 const PREVIEW_WARMUP_PROFILE = 'preview'
 const PREVIEW_WARMUP_QUALITY = 82
@@ -126,8 +132,13 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const pendingRemovedPathsByWorkspace = new Map<number, Set<string>>()
   const fileEventFlushTimerByWorkspace = new Map<number, number>()
   const warmupTokensByWorkspace = new Map<number, { cancelled: boolean }>()
+  const warmupBatchContextByWorkspace = new Map<number, WarmupBatchContext>()
+  const warmupTargetTotalByWorkspace = new Map<number, number>()
   const recentUiActivityAtByWorkspace = new Map<number, number>()
   const recentGridTrimAtByWorkspace = new Map<number, number>()
+  const warmupPopupVisible = ref(false)
+  const warmupPopupMinimized = ref(true)
+  const warmupPopupWorkspaceId = ref<number | null>(null)
   let activityListenersBound = false
 
   const activeTab = computed(() => tabs.value[activeTabIndex.value] ?? null)
@@ -140,10 +151,53 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     return tabs.value.find(t => t.workspace.id === workspaceId)
   }
 
+  async function getWorkspacePresentPhotoCount(workspaceId: number) {
+    try {
+      const count: number = await invoke('get_workspace_present_photo_count', { workspaceId })
+      return Math.max(0, count ?? 0)
+    } catch {
+      const tab = getTabByWorkspaceId(workspaceId)
+      const fallback = tab?.workspace.photo_count ?? tab?.warmupTotal ?? 0
+      return Math.max(0, fallback)
+    }
+  }
+
+  async function refreshWorkspacePhotoCount(workspaceId: number) {
+    const count = await getWorkspacePresentPhotoCount(workspaceId)
+    const tab = getTabByWorkspaceId(workspaceId)
+    if (tab) tab.workspace.photo_count = count
+    return count
+  }
+
   function stopWarmupPipeline(workspaceId: number) {
     const token = warmupTokensByWorkspace.get(workspaceId)
     if (token) token.cancelled = true
     warmupTokensByWorkspace.delete(workspaceId)
+    warmupBatchContextByWorkspace.delete(workspaceId)
+  }
+
+  function showWarmupPopup(workspaceId?: number, minimized = warmupPopupMinimized.value) {
+    const target = workspaceId ?? activeTab.value?.workspace.id ?? warmupPopupWorkspaceId.value
+    if (target == null) return
+    warmupPopupWorkspaceId.value = target
+    warmupPopupVisible.value = true
+    warmupPopupMinimized.value = minimized
+  }
+
+  function hideWarmupPopup() {
+    warmupPopupVisible.value = false
+  }
+
+  function setWarmupPopupMinimized(minimized: boolean) {
+    warmupPopupMinimized.value = minimized
+  }
+
+  function autoShowWarmupPopup(workspaceId: number) {
+    const settings = readWarmupSettings()
+    if (!settings.popupAutoShow) return
+    warmupPopupWorkspaceId.value = workspaceId
+    warmupPopupVisible.value = true
+    warmupPopupMinimized.value = true
   }
 
   function markWorkspaceUiActivity(workspaceId?: number | null) {
@@ -178,15 +232,24 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     }
   }
 
-  async function runWarmupBatch(workspaceId: number, workspacePath: string, limit: number, offset: number) {
+  async function runWarmupBatch(
+    workspaceId: number,
+    workspacePath: string,
+    limit: number,
+    offset: number,
+    concurrency: number,
+    baseDone: number,
+    total: number,
+  ) {
     if (limit <= 0) return 0
     const tab = getTabByWorkspaceId(workspaceId)
     if (tab) {
       tab.warmupRunning = true
-      tab.warmupDone = 0
-      tab.warmupTotal = limit
+      tab.warmupDone = Math.max(0, Math.min(total, baseDone))
+      tab.warmupTotal = total
       tab.warmupCurrent = null
     }
+    warmupBatchContextByWorkspace.set(workspaceId, { baseDone, total })
     try {
       const processed: number = await invoke('warmup_previews', {
         workspaceId,
@@ -196,10 +259,19 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         quality: PREVIEW_WARMUP_QUALITY,
         offset,
         limit,
+        concurrency,
       })
-      return Math.max(0, processed ?? 0)
+      const safeProcessed = Math.max(0, processed ?? 0)
+      const current = getTabByWorkspaceId(workspaceId)
+      if (current) {
+        current.warmupDone = Math.max(0, Math.min(total, baseDone + safeProcessed))
+        current.warmupTotal = total
+      }
+      return safeProcessed
     } catch {
       return 0
+    } finally {
+      warmupBatchContextByWorkspace.delete(workspaceId)
     }
   }
 
@@ -208,12 +280,23 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     const token = { cancelled: false }
     warmupTokensByWorkspace.set(workspaceId, token)
 
+    const total = await getWorkspacePresentPhotoCount(workspaceId)
+    warmupTargetTotalByWorkspace.set(workspaceId, total)
+
     const tab = getTabByWorkspaceId(workspaceId)
     if (tab) {
-      tab.warmupRunning = true
+      tab.warmupRunning = total > 0
       tab.warmupDone = 0
-      tab.warmupTotal = null
+      tab.warmupTotal = total
+      tab.warmupSucceeded = 0
       tab.warmupCurrent = null
+      tab.workspace.photo_count = total
+    }
+    autoShowWarmupPopup(workspaceId)
+    if (total <= 0) {
+      if (tab) tab.warmupRunning = false
+      warmupTokensByWorkspace.delete(workspaceId)
+      return
     }
 
     const settings = readWarmupSettings()
@@ -225,9 +308,18 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         warmupTokensByWorkspace.delete(workspaceId)
         return
       }
-      const processed = await runWarmupBatch(workspaceId, workspacePath, settings.initialLimit, offset)
+      const firstBatch = Math.min(settings.initialLimit, Math.max(0, total - offset))
+      const processed = await runWarmupBatch(
+        workspaceId,
+        workspacePath,
+        firstBatch,
+        offset,
+        settings.workerConcurrency,
+        offset,
+        total,
+      )
       offset += processed
-      if (processed < settings.initialLimit) {
+      if (processed < firstBatch) {
         if (tab) tab.warmupRunning = false
         warmupTokensByWorkspace.delete(workspaceId)
         return
@@ -249,10 +341,20 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       await waitForWarmupWindow(workspaceId, token)
       if (token.cancelled) break
 
-      const processed = await runWarmupBatch(workspaceId, workspacePath, latest.backgroundBatch, offset)
+      const batchLimit = Math.min(latest.backgroundBatch, Math.max(0, total - offset))
+      if (batchLimit <= 0) break
+      const processed = await runWarmupBatch(
+        workspaceId,
+        workspacePath,
+        batchLimit,
+        offset,
+        latest.workerConcurrency,
+        offset,
+        total,
+      )
       if (processed <= 0) break
       offset += processed
-      if (processed < latest.backgroundBatch) break
+      if (processed < batchLimit) break
       const target = getTabByWorkspaceId(workspaceId)
       if (target) target.warmupRunning = true
       await sleep(latest.backgroundDelayMs)
@@ -262,8 +364,11 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       const target = getTabByWorkspaceId(workspaceId)
       if (target) {
         target.warmupRunning = false
+        target.warmupDone = Math.max(0, Math.min(total, offset))
+        target.warmupTotal = total
       }
     }
+    warmupBatchContextByWorkspace.delete(workspaceId)
     warmupTokensByWorkspace.delete(workspaceId)
   }
 
@@ -327,6 +432,10 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       tabs.value.splice(index, 1)
       if (!tabs.value.some(t => t.workspace.id === wsId)) {
         stopWarmupPipeline(wsId)
+        if (warmupPopupWorkspaceId.value === wsId) {
+          warmupPopupWorkspaceId.value = null
+          warmupPopupVisible.value = false
+        }
         metaCacheByWorkspace.delete(wsId)
         removedMetaCacheByWorkspace.delete(wsId)
         metaHydratedWorkspace.delete(wsId)
@@ -334,6 +443,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         metaPresenceSyncInFlight.delete(wsId)
         pendingCreatedPathsByWorkspace.delete(wsId)
         pendingRemovedPathsByWorkspace.delete(wsId)
+        warmupBatchContextByWorkspace.delete(wsId)
+        warmupTargetTotalByWorkspace.delete(wsId)
         recentUiActivityAtByWorkspace.delete(wsId)
         recentGridTrimAtByWorkspace.delete(wsId)
         const timer = fileEventFlushTimerByWorkspace.get(wsId)
@@ -563,10 +674,20 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
     const tabIndex = tabs.value.findIndex(t => t.workspace.id === workspaceId)
     if (tabIndex >= 0) {
+      const currentTab = tabs.value[tabIndex]
       await loadPhotos(tabIndex, { refreshMeta: true })
       await syncRemovedMetaCache(workspaceId)
-      await refreshSubfolders(tabs.value[tabIndex])
-      await refreshTreeFiles(tabs.value[tabIndex])
+      await refreshSubfolders(currentTab)
+      await refreshTreeFiles(currentTab)
+      const latestCount = await refreshWorkspacePhotoCount(workspaceId)
+      warmupTargetTotalByWorkspace.set(workspaceId, latestCount)
+      if (!warmupTokensByWorkspace.has(workspaceId)) {
+        currentTab.warmupTotal = latestCount
+        currentTab.warmupDone = Math.max(0, Math.min(currentTab.warmupDone, latestCount))
+      }
+      if (created.length > 0) {
+        void startWarmupPipeline(workspaceId, currentTab.workspace.path)
+      }
     }
   }
 
@@ -575,11 +696,21 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     const tab = tabs.value[i]
     if (!tab) return
 
-    const useMetaQuery = filterNeedsMetaQuery(tab.filter)
+    const effectiveFilter: PhotoFilter = { ...tab.filter }
+    // Grid-specific advanced filters should not affect cull mode browsing.
+    if (tab.viewMode === 'cull') {
+      delete effectiveFilter.filename_contains
+      delete effectiveFilter.star_min
+      delete effectiveFilter.star_none
+      delete effectiveFilter.color_labels
+      delete effectiveFilter.color_none
+    }
+
+    const useMetaQuery = filterNeedsMetaQuery(effectiveFilter)
     const command = useMetaQuery ? 'get_photos' : 'get_photos_basic'
     const photos: Photo[] = await invoke(command, {
       workspaceId: tab.workspace.id,
-      filter: tab.filter,
+      filter: effectiveFilter,
     })
     tab.photos = photos
 
@@ -746,14 +877,21 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   function setViewMode(mode: 'grid' | 'cull') {
     const tab = activeTab.value
     if (!tab) return
+    if (tab.viewMode === mode) return
     tab.viewMode = mode
-    if (mode === 'cull') {
+    const applyCullTarget = () => {
       const firstSelectedId = tab.selectedIds.values().next().value as number | undefined
       const targetId = tab.activePhotoId ?? firstSelectedId ?? tab.photos[0]?.id ?? null
       if (targetId != null) {
         const idx = tab.photos.findIndex(p => p.id === targetId)
         tab.cullIndex = idx >= 0 ? idx : 0
       }
+    }
+    void loadPhotos(undefined, { refreshMeta: false }).then(() => {
+      if (mode === 'cull') applyCullTarget()
+    })
+    if (mode === 'cull') {
+      applyCullTarget()
     }
   }
 
@@ -811,6 +949,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         tab.scanTotal = event.payload.count ?? tab.scanTotal
         tab.scanCurrent = null
         tab.workspace.photo_count = event.payload.count
+        warmupTargetTotalByWorkspace.set(tab.workspace.id, Math.max(0, event.payload.count ?? 0))
         await loadPhotos(tabs.value.indexOf(tab), { refreshMeta: true })
         await syncRemovedMetaCache(tab.workspace.id)
         await refreshSubfolders(tab)
@@ -831,11 +970,22 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     await listen<WarmupProgressPayload>('warmup-progress', async (event) => {
       const tab = tabs.value.find(t => t.workspace.id === event.payload.workspace_id)
       if (!tab) return
-      tab.warmupDone = Math.max(0, event.payload.done ?? 0)
-      tab.warmupTotal = event.payload.total > 0 ? event.payload.total : null
-      tab.warmupSucceeded = Math.max(0, event.payload.succeeded ?? tab.warmupSucceeded)
+      const batch = warmupBatchContextByWorkspace.get(event.payload.workspace_id)
+      const targetTotal = batch?.total ??
+        warmupTargetTotalByWorkspace.get(event.payload.workspace_id) ??
+        tab.warmupTotal ??
+        (event.payload.total > 0 ? event.payload.total : 0)
+      const safeTotal = Math.max(0, targetTotal)
+      const nextDone = batch
+        ? Math.max(0, Math.min(safeTotal, (batch.baseDone ?? 0) + Math.max(0, event.payload.done ?? 0)))
+        : Math.max(0, event.payload.done ?? 0)
+      const nextSucceeded = batch
+        ? Math.max(0, Math.min(safeTotal, (batch.baseDone ?? 0) + Math.max(0, event.payload.succeeded ?? 0)))
+        : Math.max(0, event.payload.succeeded ?? tab.warmupSucceeded)
+      tab.warmupDone = nextDone
+      tab.warmupTotal = safeTotal > 0 ? safeTotal : null
+      tab.warmupSucceeded = nextSucceeded
       tab.warmupCurrent = event.payload.current_file ?? null
-      tab.warmupRunning = event.payload.finished !== true
     })
 
     await listen<{ workspace_id: number; paths: string[] }>('file-created', async (event) => {
@@ -894,6 +1044,12 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     setViewMode,
     setCullIndex,
     restartWarmupForActiveWorkspace,
+    warmupPopupVisible,
+    warmupPopupMinimized,
+    warmupPopupWorkspaceId,
+    showWarmupPopup,
+    hideWarmupPopup,
+    setWarmupPopupMinimized,
     saveTabSettings,
     setupListeners,
   }

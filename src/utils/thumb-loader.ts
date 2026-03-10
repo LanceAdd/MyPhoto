@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { toTauriImageSrc } from './image-src'
-import { normalizeThumbSize } from './thumb-cache'
-import { estimateThumbBytes, getFastThumb, putFastThumb } from './thumb-fast-cache'
+import { clearThumbCache, normalizeThumbSize } from './thumb-cache'
+import { clearFastThumbCache, estimateThumbBytes, getFastThumb, putFastThumb } from './thumb-fast-cache'
 import {
   cancelPendingThumbTasks,
   enqueueThumbTask,
@@ -130,6 +130,12 @@ export function hasActiveGridDemand() {
 export function trimLowPriorityThumbTasks() {
   if (!isSchedulerV2Enabled()) return 0
   return cancelPendingThumbTasks((priority) => priority === 'p3' || priority === 'p4')
+}
+
+export function clearGridThumbCaches() {
+  clearThumbCache()
+  clearFastThumbCache()
+  cancelPendingThumbTasks(() => true)
 }
 
 export function getGridThumbQueueStats() {

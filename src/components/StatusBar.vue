@@ -22,6 +22,7 @@
         <div class="progress-fill" :class="{ indeterminate: activeTask.indeterminate }" :style="fillStyle(activeTask.percent)" />
       </div>
       <span class="task-meta">{{ activeTask.meta }}</span>
+      <button v-if="activeTask.kind === 'warmup'" class="task-link" @click="openWarmupPopup">详情</button>
     </div>
     <span v-else class="workspace-path">{{ tab?.workspace.path }}</span>
   </div>
@@ -40,6 +41,10 @@ const hasFilter = computed(() => {
 })
 const filteredCount = computed(() => tab.value?.photos.length ?? 0)
 const missingCount = computed(() => tab.value?.photos.filter(p => p.is_missing).length ?? 0)
+
+function openWarmupPopup() {
+  store.showWarmupPopup(store.activeTab?.workspace.id, false)
+}
 
 function scanPhaseLabel(phase?: string) {
   switch (phase) {
@@ -160,6 +165,16 @@ const activeTask = computed(() => {
   white-space: nowrap;
 }
 .task-meta { color: #93a1b9; min-width: 46px; text-align: right; }
+.task-link {
+  border: 1px solid #3b4b64;
+  background: #1d2b42;
+  color: #9fc1ff;
+  border-radius: 5px;
+  padding: 2px 6px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.task-link:hover { color: #fff; border-color: #5f8de0; }
 .task-progress.error .task-label,
 .task-progress.error .task-meta,
 .task-progress.error .task-content { color: #e07a7a; }

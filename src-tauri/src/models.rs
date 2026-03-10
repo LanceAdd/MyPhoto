@@ -55,6 +55,7 @@ pub struct Keybinding {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhotoFilter {
     pub subfolder: Option<String>,
+    pub filename_contains: Option<String>,
     pub star_min: Option<i64>,
     pub star_none: Option<bool>,
     pub color_labels: Option<Vec<String>>,
@@ -79,6 +80,8 @@ pub struct ExportOptions {
     pub max_dimension: Option<u32>, // long edge limit, None = original
     pub naming_rule: String,        // "original" | "date_seq"
     pub conflict: String,           // "skip" | "overwrite" | "rename"
+    pub rename_prefix: Option<String>,      // Optional prefix for conflict rename
+    pub rename_suffix_mode: Option<String>, // "seq" | "date_seq" | "timestamp_seq"
 }
 
 #[allow(dead_code)]
@@ -89,4 +92,13 @@ pub struct ExportProgress {
     pub current_file: String,
     pub finished: bool,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchRenameSummary {
+    pub total: usize,
+    pub renamed: usize,
+    pub skipped_conflict: usize,
+    pub skipped_missing: usize,
+    pub failed: usize,
 }

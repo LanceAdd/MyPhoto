@@ -1,4 +1,4 @@
-<template>
+﻿<template>
   <div class="file-tree" @contextmenu.prevent="onTreeContextMenu($event, null, 'root')">
     <div class="tree-header">
       <span>{{ tab?.workspace.name }}</span>
@@ -10,7 +10,7 @@
       @click="selectFolder(null)"
       @contextmenu.stop.prevent="onTreeContextMenu($event, null, 'root')"
     >
-      <span class="tree-icon icon-root">🏠</span>
+      <span class="tree-icon icon-root">📔</span>
       <span class="tree-name" title="全部照片">全部照片</span>
       <span class="tree-count">{{ tab?.treeFiles.length ?? 0 }}</span>
     </div>
@@ -78,6 +78,7 @@ import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { NDropdown, NModal, NCard, NInput, NButton, useMessage } from 'naive-ui'
 import { useWorkspaceStore, type WorkspaceFile } from '../stores/workspace'
+import { clearGridThumbCaches } from '../utils/thumb-loader'
 
 type ContextTargetType = 'root' | 'folder' | 'file'
 
@@ -86,6 +87,14 @@ interface FlatTreeNode {
   path: string
   name: string
   depth: number
+}
+
+interface BatchRenameSummary {
+  total: number
+  renamed: number
+  skipped_conflict: number
+  skipped_missing: number
+  failed: number
 }
 
 const store = useWorkspaceStore()
@@ -106,6 +115,8 @@ const showRename = ref(false)
 const renameValue = ref('')
 const showNewFolder = ref(false)
 const newFolderName = ref('')
+const batchRenamePrefix = ref('IMG_')
+const batchRenaming = ref(false)
 
 const renameTitle = computed(() => ctxTargetType.value === 'file' ? '重命名文件' : '重命名文件夹')
 
@@ -238,6 +249,54 @@ async function selectFile(filePath: string) {
   }
 }
 
+function formatBatchRenameMessage(summary: BatchRenameSummary) {
+  return `共 ${summary.total} 张，成功 ${summary.renamed}，冲突跳过 ${summary.skipped_conflict}，缺失跳过 ${summary.skipped_missing}，失败 ${summary.failed}`
+}
+
+async function batchRenameAllPhotos() {
+  const t = tab.value
+  if (!t || batchRenaming.value) return
+
+  const nextPrefix = window.prompt('请输入批量重命名前缀（默认 IMG_）', batchRenamePrefix.value) ?? ''
+  const prefix = nextPrefix.trim()
+  if (!prefix) {
+    message.warning('重命名前缀不能为空')
+    return
+  }
+  batchRenamePrefix.value = prefix
+
+  const confirmed = window.confirm(
+    '重命名会触发缩略图重新预热。\n当前缓存键包含文件路径，旧缓存不会直接命中，将按新路径逐步生成。\n是否继续？',
+  )
+  if (!confirmed) return
+
+  batchRenaming.value = true
+  try {
+    const summary: BatchRenameSummary = await invoke('batch_rename_workspace_photos', {
+      workspaceId: t.workspace.id,
+      workspacePath: t.workspace.path,
+      prefix,
+      startIndex: 1,
+      padding: 4,
+    })
+
+    clearGridThumbCaches()
+    activeFolder.value = null
+    activeFile.value = null
+    fileSelectToken.value++
+
+    await refreshTreeData()
+    await store.loadPhotos()
+    store.restartWarmupForActiveWorkspace()
+
+    message.success(`${formatBatchRenameMessage(summary)}；已自动重新预热`) 
+  } catch (error) {
+    message.error(`批量重命名失败: ${String(error)}`)
+  } finally {
+    batchRenaming.value = false
+  }
+}
+
 function onTreeContextMenu(e: MouseEvent, path: string | null, kind: ContextTargetType) {
   if (kind === 'file' && path) {
     activeFile.value = normalizePath(path)
@@ -295,6 +354,7 @@ const contextMenuOptions = computed(() => {
     { type: 'divider', key: 'd0' },
     { label: '复制绝对路径', key: 'copy_path' },
     { label: '新建文件夹', key: 'new_folder' },
+    { label: '批量重命名全部图片', key: 'batch_rename_all' },
     { type: 'divider', key: 'd1' },
     { label: '刷新文件树', key: 'refresh_tree' },
     { label: '重新扫描工作区', key: 'rescan_workspace' },
@@ -378,6 +438,11 @@ async function onContextMenuSelect(key: string) {
     return
   }
 
+  if (key === 'batch_rename_all') {
+    await batchRenameAllPhotos()
+    return
+  }
+
   if (key === 'rename') {
     if (ctxTargetType.value === 'root') return
     renameValue.value = pathName(ctxTargetPath.value ?? '')
@@ -432,6 +497,7 @@ async function doRename() {
   })
 
   showRename.value = false
+  clearGridThumbCaches()
   await refreshTreeData()
   await requestRescan()
   await store.loadPhotos()
@@ -444,7 +510,7 @@ async function doRename() {
     activeFolder.value = nextRelPath
     activeFile.value = null
   }
-  message.success(`${ctxTargetType.value === 'file' ? '文件' : '文件夹'}已重命名`)
+  message.success(`${ctxTargetType.value === 'file' ? '文件' : '文件夹'}已重命名，将自动重新预热`)
 }
 
 async function doCreateFolder() {

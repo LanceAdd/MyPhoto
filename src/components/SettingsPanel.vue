@@ -30,6 +30,18 @@
           </div>
 
           <div class="form-row">
+            <label>预热线程数</label>
+            <input v-model.number="workerConcurrency" type="number" min="1" max="8" step="1" />
+          </div>
+
+          <div class="form-row checkbox-row">
+            <label>
+              <input v-model="popupAutoShow" type="checkbox" />
+              每次打开工作区时自动显示预热进度卡片
+            </label>
+          </div>
+
+          <div class="form-row">
             <label>网格行布局</label>
             <select v-model="gridRowAlignMode">
               <option value="center">整行居中（默认）</option>
@@ -153,6 +165,8 @@ const activeSection = ref<'performance' | 'keybindings' | 'about'>('performance'
 
 const initialLimit = ref(40)
 const continueInBackground = ref(true)
+const workerConcurrency = ref(3)
+const popupAutoShow = ref(true)
 const gridRowAlignMode = ref<GridRowAlignMode>('center')
 const performanceMessage = ref('')
 const savingSettings = ref(false)
@@ -173,6 +187,8 @@ function loadWarmupPrefs() {
   const settings = readWarmupSettings()
   initialLimit.value = settings.initialLimit
   continueInBackground.value = settings.continueInBackground
+  workerConcurrency.value = settings.workerConcurrency
+  popupAutoShow.value = settings.popupAutoShow
   gridRowAlignMode.value = useGridRowAlignMode().value
 }
 
@@ -303,10 +319,14 @@ async function saveWarmupPrefs() {
     const next = saveWarmupSettings({
       initialLimit: initialLimit.value,
       continueInBackground: continueInBackground.value,
+      workerConcurrency: workerConcurrency.value,
+      popupAutoShow: popupAutoShow.value,
     })
     setGridRowAlignMode(gridRowAlignMode.value)
     initialLimit.value = next.initialLimit
     continueInBackground.value = next.continueInBackground
+    workerConcurrency.value = next.workerConcurrency
+    popupAutoShow.value = next.popupAutoShow
     workspaceStore.restartWarmupForActiveWorkspace()
     performanceMessage.value = '已保存并应用到当前工作区。'
   } finally {

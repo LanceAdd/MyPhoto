@@ -103,6 +103,11 @@ async fn get_workspace_present_photo_ids(workspace_id: i64) -> Result<Vec<i64>, 
 }
 
 #[tauri::command]
+async fn get_workspace_present_photo_count(workspace_id: i64) -> Result<usize, String> {
+    photos::get_workspace_present_photo_count(workspace_id)
+}
+
+#[tauri::command]
 async fn sync_created_files(
     workspace_id: i64,
     workspace_path: String,
@@ -149,6 +154,7 @@ async fn warmup_previews(
     quality: u8,
     offset: usize,
     limit: usize,
+    concurrency: usize,
     app: AppHandle,
 ) -> Result<usize, String> {
     imaging::warmup_preview_cache_with_progress(
@@ -159,6 +165,7 @@ async fn warmup_previews(
         quality,
         offset,
         limit,
+        concurrency,
         |progress| {
             let _ = app.emit(
                 "warmup-progress",
@@ -251,11 +258,20 @@ async fn export_photos(
 async fn open_in_explorer(path: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("explorer")
-            .arg("/select,")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        let input = std::path::PathBuf::from(&path);
+        let normalized = std::fs::canonicalize(&input).unwrap_or(input.clone());
+        if normalized.is_dir() {
+            std::process::Command::new("explorer")
+                .arg(&normalized)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        } else {
+            let select_arg = format!("/select,{}", normalized.to_string_lossy());
+            std::process::Command::new("explorer")
+                .arg(select_arg)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -417,6 +433,23 @@ async fn rename_entry(path: String, new_name: String) -> Result<String, String> 
 }
 
 #[tauri::command]
+async fn batch_rename_workspace_photos(
+    workspace_id: i64,
+    workspace_path: String,
+    prefix: String,
+    start_index: Option<usize>,
+    padding: Option<usize>,
+) -> Result<BatchRenameSummary, String> {
+    photos::batch_rename_workspace_photos(
+        workspace_id,
+        &workspace_path,
+        &prefix,
+        start_index.unwrap_or(1),
+        padding.unwrap_or(4),
+    )
+}
+
+#[tauri::command]
 async fn create_folder(parent_path: String, name: String) -> Result<String, String> {
     let new_path = std::path::PathBuf::from(&parent_path).join(&name);
     std::fs::create_dir_all(&new_path).map_err(|e| e.to_string())?;
@@ -554,6 +587,7 @@ pub fn run() {
             get_photos_basic,
             get_workspace_photo_meta,
             get_workspace_present_photo_ids,
+            get_workspace_present_photo_count,
             sync_created_files,
             sync_removed_files,
             get_subfolders,
@@ -573,6 +607,7 @@ pub fn run() {
             move_photos,
             rename_folder,
             rename_entry,
+            batch_rename_workspace_photos,
             create_folder,
             delete_entry,
             get_keybindings,

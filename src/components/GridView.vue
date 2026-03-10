@@ -6,7 +6,19 @@
     @scroll="onScroll"
     tabindex="0"
   >
-    <div v-if="photos.length > 0" class="grid-actions">
+    <div v-if="tab" class="grid-actions">
+      <n-select
+        v-model:value="sortBy"
+        :options="sortOptions"
+        size="small"
+        class="grid-sort-select"
+      />
+      <button
+        class="grid-action-btn"
+        @click="toggleSortDir"
+        :title="sortDesc ? '当前降序，点击切换升序' : '当前升序，点击切换降序'"
+      >{{ sortDesc ? '降序' : '升序' }}</button>
+
       <button
         class="grid-action-btn"
         :disabled="photos.length === 0"
@@ -19,7 +31,70 @@
         @click="store.clearSelection()"
         title="取消当前选择"
       >取消全选</button>
+      <button
+        class="grid-action-btn"
+        @click="toggleAdvancedFilters"
+        :title="showAdvancedFilters ? '收起高级筛选' : '展开高级筛选'"
+      >{{ showAdvancedFilters ? '收起筛选' : '高级筛选' }}</button>
       <span class="grid-selected-hint">已选 {{ selectedCount }}</span>
+      <span v-if="activeFilterCount > 0" class="grid-filter-hint">筛选 {{ activeFilterCount }}</span>
+    </div>
+
+    <div v-if="tab && showAdvancedFilters" class="grid-filters-row">
+      <div class="filter-group filter-section">
+        <span class="filter-label">星级</span>
+        <button
+          class="star-filter-btn"
+          :class="{ active: starFilter === 0 }"
+          @click="setStarFilter(0)"
+          title="全部"
+        >全部</button>
+        <button
+          class="star-filter-btn"
+          :class="{ active: starFilter === 'none' }"
+          @click="setStarFilter('none')"
+          title="无星级"
+        >无星</button>
+        <button
+          v-for="n in [1, 2, 3, 4, 5]"
+          :key="`star-${n}`"
+          class="star-filter-btn"
+          :class="{ active: starFilter === n }"
+          @click="setStarFilter(n as 1 | 2 | 3 | 4 | 5)"
+          :title="`${n} 星`"
+        >{{ '★'.repeat(n) }}</button>
+        <button
+          v-if="starFilter !== 0"
+          class="icon-btn"
+          @click="clearStarFilter"
+          title="清除星级筛选"
+        >×</button>
+      </div>
+
+      <div class="filter-group filter-section">
+        <span class="filter-label">颜色</span>
+        <button
+          class="none-filter-btn"
+          :class="{ active: colorNone }"
+          @click="toggleNoColorFilter"
+          title="无颜色"
+        >无色</button>
+        <button
+          v-for="color in colorOptions"
+          :key="`color-${color.value}`"
+          class="color-filter-btn"
+          :class="{ active: activeColors.includes(color.value) }"
+          :style="{ '--color': color.hex }"
+          @click="toggleColorFilter(color.value)"
+          :title="color.label"
+        />
+        <button
+          v-if="colorNone || activeColors.length"
+          class="icon-btn"
+          @click="clearColorFilter"
+          title="清除颜色筛选"
+        >×</button>
+      </div>
     </div>
 
     <!-- Scanning indicator -->
@@ -30,7 +105,9 @@
     <!-- Empty -->
     <div v-if="photos.length === 0" class="empty">
       <span>📷</span>
-      <p>{{ tab?.scanning ? '正在扫描照片...' : '此文件夹中没有照片' }}</p>
+      <p v-if="tab?.scanning">正在扫描照片...</p>
+      <p v-else-if="activeFilterCount > 0">当前筛选无结果，请调整筛选条件</p>
+      <p v-else>此文件夹中没有照片</p>
     </div>
 
     <!-- Virtual grid -->
@@ -81,28 +158,20 @@
       @select="onContextMenuSelect"
     />
 
-    <!-- Copy to folder dialog -->
-    <n-modal v-model:show="showCopyDialog">
-      <n-card title="复制到文件夹" style="width:400px">
-        <n-input v-model:value="copyDestPath" placeholder="目标文件夹路径" />
-        <template #footer>
-          <div style="display:flex;gap:8px;justify-content:flex-end">
-            <n-button @click="showCopyDialog = false">取消</n-button>
-            <n-button type="primary" @click="doCopyPhotos">确认</n-button>
-          </div>
-        </template>
-      </n-card>
-    </n-modal>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, inject } from 'vue'
-import { NDropdown, NModal, NCard, NInput, NButton, useMessage } from 'naive-ui'
+import { NDropdown, NSelect, useMessage } from 'naive-ui'
 import { invoke } from '@tauri-apps/api/core'
+import { open } from '@tauri-apps/plugin-dialog'
 import { useWorkspaceStore, type Photo } from '../stores/workspace'
 import PhotoCard from './PhotoCard.vue'
 import { useGridRowAlignMode } from '../utils/grid-row-settings'
+
+type StarFilterValue = 0 | 1 | 2 | 3 | 4 | 5 | 'none'
+const ADVANCED_FILTERS_EXPANDED_KEY = 'grid.filters.advanced.expanded'
 
 const store = useWorkspaceStore()
 const message = useMessage()
@@ -113,6 +182,40 @@ const tab = computed(() => store.activeTab)
 const photos = computed(() => tab.value?.photos ?? [])
 const selectedCount = computed(() => tab.value?.selectedIds.size ?? 0)
 const gridRowAlignMode = useGridRowAlignMode()
+const sortBy = computed({
+  get: () => tab.value?.filter.sort_by ?? 'taken_at',
+  set: (val: string) => store.setFilter({ sort_by: val }),
+})
+const sortDesc = computed(() => tab.value?.filter.sort_desc === true)
+const sortOptions = [
+  { label: '拍摄时间', value: 'taken_at' },
+  { label: '文件名', value: 'filename' },
+  { label: '文件大小', value: 'file_size' },
+  { label: '星级', value: 'star_rating' },
+]
+const starFilter = computed<StarFilterValue>(() => {
+  if (tab.value?.filter.star_none === true) return 'none'
+  const min = tab.value?.filter.star_min ?? 0
+  return [0, 1, 2, 3, 4, 5].includes(min) ? (min as StarFilterValue) : 0
+})
+const activeColors = computed(() => tab.value?.filter.color_labels ?? [])
+const colorNone = computed(() => tab.value?.filter.color_none === true)
+const colorOptions = [
+  { value: 'red', label: '红色', hex: '#e74c3c' },
+  { value: 'orange', label: '橙色', hex: '#e67e22' },
+  { value: 'yellow', label: '黄色', hex: '#f1c40f' },
+  { value: 'green', label: '绿色', hex: '#2ecc71' },
+  { value: 'blue', label: '蓝色', hex: '#3498db' },
+  { value: 'purple', label: '紫色', hex: '#9b59b6' },
+]
+const showAdvancedFilters = ref(readStoredBool(ADVANCED_FILTERS_EXPANDED_KEY, false))
+const activeFilterCount = computed(() => {
+  let count = 0
+  if (starFilter.value === 'none' || starFilter.value > 0) count += 1
+  if (colorNone.value) count += 1
+  if (activeColors.value.length > 0) count += 1
+  return count
+})
 
 const containerRef = ref<HTMLElement>()
 const containerWidth = ref(800)
@@ -200,11 +303,74 @@ function onScroll(e: Event) {
   if (tab.value) tab.value.scrollTop = scrollTop.value
 }
 
+function toggleSortDir() {
+  store.setFilter({ sort_desc: !sortDesc.value })
+}
+
+function setStarFilter(val: StarFilterValue) {
+  if (val === 'none') {
+    store.setFilter({
+      star_none: true,
+      star_min: undefined,
+    })
+    return
+  }
+  store.setFilter({
+    star_none: undefined,
+    star_min: val > 0 ? val : undefined,
+  })
+}
+
+function clearStarFilter() {
+  setStarFilter(0)
+}
+
+function applyColorFilter(colors: string[], none: boolean) {
+  store.setFilter({
+    color_labels: colors.length ? [...colors] : undefined,
+    color_none: none ? true : undefined,
+  })
+}
+
+function toggleColorFilter(color: string) {
+  const colors = [...activeColors.value]
+  const idx = colors.indexOf(color)
+  if (idx >= 0) colors.splice(idx, 1)
+  else colors.push(color)
+  applyColorFilter(colors, colorNone.value)
+}
+
+function toggleNoColorFilter() {
+  applyColorFilter(activeColors.value, !colorNone.value)
+}
+
+function clearColorFilter() {
+  applyColorFilter([], false)
+}
+
+function toggleAdvancedFilters() {
+  showAdvancedFilters.value = !showAdvancedFilters.value
+  try {
+    localStorage.setItem(ADVANCED_FILTERS_EXPANDED_KEY, String(showAdvancedFilters.value))
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function readStoredBool(key: string, fallback: boolean) {
+  try {
+    const raw = localStorage.getItem(key)
+    if (raw == null) return fallback
+    return raw === 'true'
+  } catch {
+    return fallback
+  }
+}
+
 // Context menu
 const ctxX = ref(0), ctxY = ref(0)
 const showContextMenu = ref(false)
 const ctxPhoto = ref<Photo | null>(null)
-const showCopyDialog = ref(false)
 const copyDestPath = ref('')
 const copyMode = ref<'copy' | 'move'>('copy')
 
@@ -282,12 +448,10 @@ async function onContextMenuSelect(key: string) {
     showExportFn()
   } else if (key === 'copy_to') {
     copyMode.value = 'copy'
-    copyDestPath.value = ''
-    showCopyDialog.value = true
+    await pickDestFolderAndRun()
   } else if (key === 'move_to') {
     copyMode.value = 'move'
-    copyDestPath.value = ''
-    showCopyDialog.value = true
+    await pickDestFolderAndRun()
   } else if (key === 'exif') {
     openLightboxFn(photo)
   } else if (key === 'delete') {
@@ -296,23 +460,49 @@ async function onContextMenuSelect(key: string) {
       workspacePath: t.workspace.path,
     })
     t.photos = t.photos.filter(p => !deleted.includes(p.id))
+    for (const id of deleted) t.selectedIds.delete(id)
+    if (t.activePhotoId != null && deleted.includes(t.activePhotoId)) {
+      t.activePhotoId = null
+    }
     message.success(`已删除 ${deleted.length} 张照片`)
   }
+}
+
+async function pickDestFolderAndRun() {
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    title: copyMode.value === 'copy' ? '选择复制目标文件夹' : '选择移动目标文件夹',
+  })
+  if (!selected || typeof selected !== 'string') return
+  copyDestPath.value = selected
+  await doCopyPhotos()
 }
 
 async function doCopyPhotos() {
   const t = tab.value
   if (!t) return
   const ids = [...t.selectedIds]
+  if (ids.length === 0) {
+    message.warning('请先选择要处理的照片')
+    return
+  }
+  if (!copyDestPath.value) {
+    message.warning('请选择目标文件夹')
+    return
+  }
   const cmd = copyMode.value === 'copy' ? 'copy_photos' : 'move_photos'
-  const count: number = await invoke(cmd, {
-    photoIds: ids,
-    workspacePath: t.workspace.path,
-    destFolder: copyDestPath.value,
-  })
-  showCopyDialog.value = false
-  message.success(`已${copyMode.value === 'copy' ? '复制' : '移动'} ${count} 张`)
-  if (copyMode.value === 'move') await store.loadPhotos()
+  try {
+    const count: number = await invoke(cmd, {
+      photoIds: ids,
+      workspacePath: t.workspace.path,
+      destFolder: copyDestPath.value,
+    })
+    message.success(`已${copyMode.value === 'copy' ? '复制' : '移动'} ${count} 张`)
+    if (copyMode.value === 'move') await store.loadPhotos()
+  } catch (error) {
+    message.error(`执行失败: ${String(error)}`)
+  }
 }
 
 function onPhotoClick(e: MouseEvent, photo: Photo) {
@@ -426,12 +616,51 @@ onUnmounted(() => resizeObserver?.disconnect())
   top: 0;
   z-index: 2;
   display: flex;
-  justify-content: flex-end;
+  justify-content: flex-start;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   margin-bottom: 8px;
   padding: 4px 0;
   background: linear-gradient(180deg, rgba(26, 26, 26, 0.96), rgba(26, 26, 26, 0.75), rgba(26, 26, 26, 0));
+}
+.grid-filters-row {
+  position: sticky;
+  top: 32px;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 4px 0;
+  background: linear-gradient(180deg, rgba(26, 26, 26, 0.94), rgba(26, 26, 26, 0.68), rgba(26, 26, 26, 0));
+}
+.grid-sort-select {
+  width: 132px;
+}
+.filter-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.filter-section {
+  padding: 2px 6px;
+  border: 1px solid #2f2f2f;
+  border-radius: 7px;
+  background: #181818;
+}
+.filter-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: #b8c7dc;
+  letter-spacing: 0.03em;
+  background: #253a57;
+  border: 1px solid #355a85;
+  border-radius: 999px;
+  padding: 1px 7px;
+  margin-right: 2px;
+  white-space: nowrap;
 }
 .grid-action-btn {
   background: #202020;
@@ -450,11 +679,75 @@ onUnmounted(() => resizeObserver?.disconnect())
   opacity: 0.45;
   cursor: default;
 }
+.star-filter-btn {
+  background: none;
+  border: 1px solid #333;
+  color: #888;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 11px;
+  transition: all 0.15s;
+}
+.star-filter-btn.active {
+  background: #f39c12;
+  border-color: #f39c12;
+  color: #1a1a1a;
+}
+.star-filter-btn:hover:not(.active) {
+  border-color: #f39c12;
+  color: #f39c12;
+}
+.none-filter-btn {
+  background: none;
+  border: 1px solid #333;
+  color: #888;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 11px;
+  transition: all 0.15s;
+}
+.none-filter-btn.active {
+  background: #555;
+  border-color: #888;
+  color: #fff;
+}
+.none-filter-btn:hover:not(.active) {
+  border-color: #aaa;
+  color: #ddd;
+}
+.color-filter-btn {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--color);
+  border: 2px solid transparent;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.color-filter-btn.active { border-color: #fff; }
+.color-filter-btn:hover { border-color: rgba(255, 255, 255, 0.6); }
+.icon-btn {
+  background: none;
+  border: 1px solid #333;
+  color: #888;
+  padding: 2px 7px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.icon-btn:hover { border-color: #4F8EF7; color: #4F8EF7; }
 .grid-selected-hint {
   font-size: 12px;
   color: #7f90ad;
   min-width: 54px;
   text-align: right;
+}
+.grid-filter-hint {
+  font-size: 12px;
+  color: #9fb6dd;
+  min-width: 56px;
 }
 .scanning-banner {
   display: flex; align-items: center; gap: 8px;
@@ -470,4 +763,3 @@ onUnmounted(() => resizeObserver?.disconnect())
 .empty p { font-size: 14px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 </style>
-

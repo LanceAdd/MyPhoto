@@ -2,10 +2,11 @@ use chrono::Utc;
 use rusqlite::params;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::db::{with_db, with_db_mut};
-use crate::models::{Photo, PhotoFilter, Workspace, WorkspaceFile};
+use crate::models::{BatchRenameSummary, Photo, PhotoFilter, Workspace, WorkspaceFile};
 
 static IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "tiff", "tif", "bmp", "heic", "heif", "raw", "cr2", "cr3",
@@ -551,6 +552,12 @@ pub fn get_photos(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<Photo>,
             conditions.push(format!("p.relative_path LIKE ?{}", param_idx));
             param_idx += 1;
         }
+        if let Some(filename) = filter.filename_contains.as_ref().map(|v| v.trim()) {
+            if !filename.is_empty() {
+                conditions.push(format!("LOWER(p.filename) LIKE LOWER(?{})", param_idx));
+                param_idx += 1;
+            }
+        }
         if filter.star_none == Some(true) {
             conditions.push("COALESCE(m.star_rating, 0) = 0".to_string());
         } else if let Some(min) = filter.star_min {
@@ -616,6 +623,12 @@ pub fn get_photos(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<Photo>,
         // Build params dynamically
         let ws_id_val = workspace_id;
         let subfolder_like = filter.subfolder.as_ref().map(|s| format!("{}%", s));
+        let filename_like = filter
+            .filename_contains
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("%{}%", s));
 
         let photos = stmt
             .query_map(
@@ -623,6 +636,7 @@ pub fn get_photos(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<Photo>,
                     ws_id_val,
                     filter,
                     subfolder_like.as_deref(),
+                    filename_like.as_deref(),
                 )),
                 |r| {
                     Ok(Photo {
@@ -661,11 +675,15 @@ fn build_params(
     workspace_id: i64,
     filter: &PhotoFilter,
     subfolder_like: Option<&str>,
+    filename_like: Option<&str>,
 ) -> Vec<rusqlite::types::Value> {
     use rusqlite::types::Value;
     let mut params: Vec<Value> = vec![Value::Integer(workspace_id)];
 
     if let Some(s) = subfolder_like {
+        params.push(Value::Text(s.to_string()));
+    }
+    if let Some(s) = filename_like {
         params.push(Value::Text(s.to_string()));
     }
     if filter.star_none != Some(true) {
@@ -850,6 +868,12 @@ pub fn get_photos_basic(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<P
             conditions.push(format!("p.relative_path LIKE ?{}", param_idx));
             param_idx += 1;
         }
+        if let Some(filename) = filter.filename_contains.as_ref().map(|v| v.trim()) {
+            if !filename.is_empty() {
+                conditions.push(format!("LOWER(p.filename) LIKE LOWER(?{})", param_idx));
+                param_idx += 1;
+            }
+        }
         if use_meta_join {
             if filter.star_none == Some(true) {
                 conditions.push("COALESCE(m.star_rating, 0) = 0".to_string());
@@ -911,9 +935,20 @@ pub fn get_photos_basic(workspace_id: i64, filter: &PhotoFilter) -> Result<Vec<P
         let mut stmt = conn.prepare(&sql)?;
         let ws_id_val = workspace_id;
         let subfolder_like = filter.subfolder.as_ref().map(|s| format!("{}%", s));
+        let filename_like = filter
+            .filename_contains
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("%{}%", s));
 
         let photos = stmt.query_map(
-            rusqlite::params_from_iter(build_params(ws_id_val, filter, subfolder_like.as_deref())),
+            rusqlite::params_from_iter(build_params(
+                ws_id_val,
+                filter,
+                subfolder_like.as_deref(),
+                filename_like.as_deref(),
+            )),
             |r| {
                 Ok(Photo {
                     id: r.get(0)?,
@@ -987,6 +1022,20 @@ pub fn get_workspace_present_photo_ids(workspace_id: i64) -> Result<Vec<i64>, St
             .filter_map(|r| r.ok())
             .collect();
         Ok(list)
+    })
+    .map_err(|e| e.to_string())
+}
+
+pub fn get_workspace_present_photo_count(workspace_id: i64) -> Result<usize, String> {
+    with_db(|conn| {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM photos
+             WHERE workspace_id = ?1 AND is_missing = 0",
+            params![workspace_id],
+            |r| r.get(0),
+        )?;
+        Ok(count.max(0) as usize)
     })
     .map_err(|e| e.to_string())
 }
@@ -1172,9 +1221,210 @@ pub fn sync_removed_files(
     Ok(synced)
 }
 
+#[derive(Debug)]
+struct RenameCandidate {
+    photo_id: i64,
+    source_abs: PathBuf,
+    target_relative_path: String,
+    target_filename: String,
+    target_abs: PathBuf,
+}
+
+#[derive(Debug)]
+struct PreparedRename {
+    candidate: RenameCandidate,
+    temp_abs: PathBuf,
+}
+
+fn filename_extension_with_dot(filename: &str) -> &str {
+    match filename.rfind('.') {
+        Some(idx) if idx > 0 && idx + 1 < filename.len() => &filename[idx..],
+        _ => "",
+    }
+}
+
+fn join_relative_path(folder: &str, filename: &str) -> String {
+    if folder.is_empty() {
+        filename.to_string()
+    } else {
+        format!("{folder}/{filename}")
+    }
+}
+
+fn format_batch_rename_filename(prefix: &str, sequence: usize, padding: usize, extension: &str) -> String {
+    let width = padding.max(1);
+    format!("{prefix}{sequence:0width$}{extension}", width = width)
+}
+
+fn make_temp_rename_path(source_abs: &Path, index: usize) -> PathBuf {
+    let parent = source_abs.parent().unwrap_or_else(|| Path::new("."));
+    let pid = std::process::id();
+    let tick = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    for attempt in 0..1024usize {
+        let candidate = parent.join(format!(
+            ".myphoto-rename-{pid}-{tick}-{index}-{attempt}.tmp"
+        ));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    parent.join(format!(".myphoto-rename-{pid}-{tick}-{index}.tmp"))
+}
+
+pub fn batch_rename_workspace_photos(
+    workspace_id: i64,
+    workspace_path: &str,
+    prefix: &str,
+    start_index: usize,
+    padding: usize,
+) -> Result<BatchRenameSummary, String> {
+    let root = PathBuf::from(workspace_path);
+    let prefix = prefix.trim();
+    let sequence_start = start_index.max(1);
+    let width = padding.clamp(1, 12);
+
+    let records: Vec<(i64, String, String)> = with_db(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, relative_path, filename
+             FROM photos
+             WHERE workspace_id = ?1 AND is_missing = 0
+             ORDER BY relative_path ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![workspace_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    })
+    .map_err(|e| e.to_string())?;
+
+    let total = records.len();
+    if total == 0 {
+        return Ok(BatchRenameSummary {
+            total: 0,
+            renamed: 0,
+            skipped_conflict: 0,
+            skipped_missing: 0,
+            failed: 0,
+        });
+    }
+
+    let source_relatives: HashSet<String> = records
+        .iter()
+        .map(|(_, relative_path, _)| relative_path.clone())
+        .collect();
+
+    let mut candidates: Vec<RenameCandidate> = Vec::new();
+    let mut renamed = 0usize;
+    let mut skipped_conflict = 0usize;
+    let mut skipped_missing = 0usize;
+    let mut failed = 0usize;
+    let mut sequence = sequence_start;
+
+    for (photo_id, relative_path, filename) in records {
+        let normalized_relative = relative_path.replace('\\', "/");
+        let source_abs = root.join(&normalized_relative);
+        if !source_abs.is_file() {
+            skipped_missing += 1;
+            continue;
+        }
+
+        let folder = normalized_relative
+            .rfind('/')
+            .map(|idx| normalized_relative[..idx].to_string())
+            .unwrap_or_default();
+        let extension = filename_extension_with_dot(&filename);
+        let target_filename = format_batch_rename_filename(prefix, sequence, width, extension);
+        sequence += 1;
+        let target_relative_path = join_relative_path(&folder, &target_filename);
+
+        if target_relative_path == normalized_relative {
+            renamed += 1;
+            continue;
+        }
+
+        let target_abs = root.join(&target_relative_path);
+        if target_abs.exists() && !source_relatives.contains(&target_relative_path) {
+            skipped_conflict += 1;
+            continue;
+        }
+
+        candidates.push(RenameCandidate {
+            photo_id,
+            source_abs,
+            target_relative_path,
+            target_filename,
+            target_abs,
+        });
+    }
+
+    let mut prepared: Vec<PreparedRename> = Vec::new();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let temp_abs = make_temp_rename_path(&candidate.source_abs, index);
+        if std::fs::rename(&candidate.source_abs, &temp_abs).is_err() {
+            failed += 1;
+            continue;
+        }
+        prepared.push(PreparedRename {
+            candidate,
+            temp_abs,
+        });
+    }
+
+    let mut db_updates: Vec<(i64, String, String)> = Vec::new();
+    for item in prepared {
+        if std::fs::rename(&item.temp_abs, &item.candidate.target_abs).is_err() {
+            let _ = std::fs::rename(&item.temp_abs, &item.candidate.source_abs);
+            failed += 1;
+            continue;
+        }
+        db_updates.push((
+            item.candidate.photo_id,
+            item.candidate.target_relative_path,
+            item.candidate.target_filename,
+        ));
+        renamed += 1;
+    }
+
+    if !db_updates.is_empty() {
+        with_db_mut(|conn| {
+            let tx = conn.transaction()?;
+            for (photo_id, relative_path, filename) in &db_updates {
+                tx.execute(
+                    "UPDATE photos
+                     SET relative_path=?1, filename=?2, is_missing=0
+                     WHERE id=?3 AND workspace_id=?4",
+                    params![relative_path, filename, photo_id, workspace_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(BatchRenameSummary {
+        total,
+        renamed,
+        skipped_conflict,
+        skipped_missing,
+        failed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{decide_scan_action, should_emit_progress, ExistingPhotoState, ScanAction};
+    use super::{
+        decide_scan_action, filename_extension_with_dot, format_batch_rename_filename,
+        should_emit_progress, ExistingPhotoState, ScanAction,
+    };
 
     fn existing(
         file_modified_at: Option<&str>,
@@ -1239,5 +1489,25 @@ mod tests {
         assert!(should_emit_progress(25, 100));
         assert!(should_emit_progress(100, 100));
         assert!(!should_emit_progress(26, 100));
+    }
+
+    #[test]
+    fn extension_with_dot_keeps_suffix() {
+        assert_eq!(filename_extension_with_dot("a.jpg"), ".jpg");
+        assert_eq!(filename_extension_with_dot("archive.tar.gz"), ".gz");
+        assert_eq!(filename_extension_with_dot(".gitignore"), "");
+        assert_eq!(filename_extension_with_dot("noext"), "");
+    }
+
+    #[test]
+    fn batch_rename_filename_formats_sequence_with_padding() {
+        assert_eq!(
+            format_batch_rename_filename("IMG_", 12, 4, ".jpg"),
+            "IMG_0012.jpg"
+        );
+        assert_eq!(
+            format_batch_rename_filename("", 3, 2, ".png"),
+            "03.png"
+        );
     }
 }

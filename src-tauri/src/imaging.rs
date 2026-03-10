@@ -1,5 +1,6 @@
 use crate::db::with_db;
 use crate::models::ExportOptions;
+use chrono::Local;
 use image::{imageops::FilterType, DynamicImage};
 use rusqlite::params;
 use std::collections::BTreeMap;
@@ -7,7 +8,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, UNIX_EPOCH};
 use walkdir::WalkDir;
 
@@ -120,6 +122,7 @@ pub fn warmup_preview_cache_with_progress<F>(
     quality: u8,
     offset: usize,
     limit: usize,
+    concurrency: usize,
     mut on_progress: F,
 ) -> Result<usize, String>
 where
@@ -153,24 +156,56 @@ where
         return Ok(0);
     }
 
+    let worker_count = normalize_warmup_concurrency(concurrency).min(total.max(1));
+    let files = Arc::new(files);
+    let next_idx = Arc::new(AtomicUsize::new(0));
+    let workspace_path_owned = workspace_path.to_string();
+    let profile_owned = profile.to_string();
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<(bool, String)>();
+
+    for _ in 0..worker_count {
+        let files_ref = Arc::clone(&files);
+        let next_idx_ref = Arc::clone(&next_idx);
+        let tx_ref = result_tx.clone();
+        let workspace_path_ref = workspace_path_owned.clone();
+        let profile_ref = profile_owned.clone();
+        std::thread::spawn(move || {
+            loop {
+                let idx = next_idx_ref.fetch_add(1, Ordering::Relaxed);
+                if idx >= files_ref.len() {
+                    break;
+                }
+                let file = &files_ref[idx];
+                let full = PathBuf::from(&workspace_path_ref).join(&file.relative_path);
+                let ok =
+                    ensure_preview_cache_path(full.to_string_lossy().as_ref(), size, &profile_ref, quality)
+                        .is_ok();
+                let _ = tx_ref.send((ok, file.filename.clone()));
+            }
+        });
+    }
+    drop(result_tx);
+
     let mut warmed = 0usize;
-    for (idx, file) in files.into_iter().enumerate() {
-        let full = PathBuf::from(workspace_path).join(file.relative_path);
-        if ensure_preview_cache_path(full.to_string_lossy().as_ref(), size, profile, quality)
-            .is_ok()
-        {
+    let mut done = 0usize;
+    for (ok, filename) in result_rx {
+        if ok {
             warmed += 1;
         }
-        let done = idx + 1;
+        done += 1;
         on_progress(WarmupProgress {
             done,
             total,
             succeeded: warmed,
-            current_file: Some(file.filename),
+            current_file: Some(filename),
             finished: done >= total,
         });
     }
     Ok(total)
+}
+
+pub fn normalize_warmup_concurrency(concurrency: usize) -> usize {
+    concurrency.clamp(1, 8)
 }
 
 fn resolve_thumbnail_cache_path_v2(
@@ -397,9 +432,9 @@ pub fn export_photos(
         .map_err(|e| e.to_string())?;
 
         let src_path = PathBuf::from(workspace_path).join(&rel_path);
-        let _ = progress_tx.send((i, filename.clone()));
 
         if !src_path.exists() {
+            let _ = progress_tx.send((i + 1, filename.clone()));
             continue;
         }
 
@@ -424,7 +459,13 @@ pub fn export_photos(
         };
         seq += 1;
 
-        let dest_file = resolve_conflict(&dest.join(&dest_name), &options.conflict);
+        let dest_file = resolve_conflict(
+            &dest.join(&dest_name),
+            &options.conflict,
+            options.rename_prefix.as_deref(),
+            options.rename_suffix_mode.as_deref(),
+            taken_at.as_deref(),
+        );
         if dest_file.is_none() {
             continue; // skip
         }
@@ -439,6 +480,7 @@ pub fn export_photos(
         }
 
         results.push(dest_file.to_string_lossy().to_string());
+        let _ = progress_tx.send((i + 1, filename.clone()));
     }
 
     let _ = progress_tx.send((total, "done".to_string()));
@@ -458,7 +500,13 @@ fn get_output_ext(format: &str, original_filename: &str) -> String {
     }
 }
 
-fn resolve_conflict(path: &Path, conflict: &str) -> Option<PathBuf> {
+fn resolve_conflict(
+    path: &Path,
+    conflict: &str,
+    rename_prefix: Option<&str>,
+    rename_suffix_mode: Option<&str>,
+    taken_at: Option<&str>,
+) -> Option<PathBuf> {
     if !path.exists() {
         return Some(path.to_path_buf());
     }
@@ -470,12 +518,14 @@ fn resolve_conflict(path: &Path, conflict: &str) -> Option<PathBuf> {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let parent = path.parent().unwrap_or(Path::new("."));
+            let prefix = sanitize_filename_fragment(rename_prefix.unwrap_or(""));
+            let suffix_mode = rename_suffix_mode
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("seq");
             for i in 1..=9999 {
-                let new_name = if ext.is_empty() {
-                    format!("{}_{}", stem, i)
-                } else {
-                    format!("{}_{}.{}", stem, i, ext)
-                };
+                let new_name =
+                    build_conflict_filename(stem, ext, &prefix, suffix_mode, i, taken_at);
                 let candidate = parent.join(new_name);
                 if !candidate.exists() {
                     return Some(candidate);
@@ -483,6 +533,44 @@ fn resolve_conflict(path: &Path, conflict: &str) -> Option<PathBuf> {
             }
             None
         }
+    }
+}
+
+fn sanitize_filename_fragment(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .collect::<String>()
+}
+
+fn current_date_stamp() -> String {
+    Local::now().format("%Y%m%d").to_string()
+}
+
+fn current_timestamp_stamp() -> String {
+    Local::now().format("%Y%m%d_%H%M%S").to_string()
+}
+
+fn build_conflict_suffix(mode: &str, index: usize, _taken_at: Option<&str>) -> String {
+    match mode {
+        "date_seq" => format!("_{}_{:03}", current_date_stamp(), index),
+        "timestamp_seq" => format!("_{}_{:03}", current_timestamp_stamp(), index),
+        _ => format!("_{:03}", index),
+    }
+}
+
+fn build_conflict_filename(
+    stem: &str,
+    ext: &str,
+    prefix: &str,
+    suffix_mode: &str,
+    index: usize,
+    taken_at: Option<&str>,
+) -> String {
+    let suffix = build_conflict_suffix(suffix_mode, index, taken_at);
+    if ext.is_empty() {
+        format!("{prefix}{stem}{suffix}")
+    } else {
+        format!("{prefix}{stem}{suffix}.{ext}")
     }
 }
 
@@ -517,9 +605,12 @@ fn save_image(img: &DynamicImage, path: &Path, format: &str, quality: u8) -> Res
 
 #[cfg(test)]
 mod tests {
+    use super::build_conflict_filename;
+    use super::build_conflict_suffix;
     use super::build_cache_key_v2;
     use super::ensure_preview_cache_path;
     use super::get_thumbnail_perf_stats;
+    use super::normalize_warmup_concurrency;
     use super::warmup_preview_cache_with_progress;
     use image::{ImageBuffer, Rgb};
     use rusqlite::params;
@@ -545,6 +636,25 @@ mod tests {
         assert!(json.get("generated").is_some());
         assert!(json.get("cache_hits").is_some());
         assert!(json.get("decode_ms_total").is_some());
+    }
+
+    #[test]
+    fn conflict_suffix_seq_mode_uses_zero_padded_counter() {
+        let suffix = build_conflict_suffix("seq", 1, None);
+        assert_eq!(suffix, "_001");
+    }
+
+    #[test]
+    fn conflict_filename_applies_prefix_before_original_stem() {
+        let file = build_conflict_filename("sunset", "jpg", "EXP_", "seq", 7, None);
+        assert_eq!(file, "EXP_sunset_007.jpg");
+    }
+
+    #[test]
+    fn warmup_concurrency_is_clamped_to_safe_bounds() {
+        assert_eq!(normalize_warmup_concurrency(0), 1);
+        assert_eq!(normalize_warmup_concurrency(3), 3);
+        assert_eq!(normalize_warmup_concurrency(32), 8);
     }
 
     #[test]
@@ -588,6 +698,7 @@ mod tests {
             82,
             0,
             2,
+            2,
             |_progress| {},
         )
         .expect("warmup should run");
@@ -622,6 +733,7 @@ mod tests {
             "preview",
             82,
             0,
+            2,
             2,
             |progress| {
                 steps.push((progress.done, progress.total, progress.finished));
@@ -782,6 +894,7 @@ mod tests {
                 quality,
                 offset,
                 batch,
+                2,
                 |_progress| {},
             )
             .expect("paged warmup run");
