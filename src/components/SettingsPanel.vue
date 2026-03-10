@@ -149,6 +149,7 @@ import { useKeybindingStore, ACTION_LABELS, ACTION_GROUPS } from '../stores/keyb
 import { useWorkspaceStore } from '../stores/workspace'
 import { readWarmupSettings, saveWarmupSettings } from '../utils/warmup-settings'
 import { setGridRowAlignMode, useGridRowAlignMode, type GridRowAlignMode } from '../utils/grid-row-settings'
+import { clearGridThumbCaches } from '../utils/thumb-loader'
 
 interface PreviewCacheInfo {
   path: string
@@ -338,6 +339,8 @@ async function rebuildCache() {
   rebuildingCache.value = true
   performanceMessage.value = ''
   try {
+    await workspaceStore.cancelAllWarmupPipelines()
+    clearGridThumbCaches()
     const removed: number = await invoke('rebuild_preview_cache')
     workspaceStore.restartWarmupForActiveWorkspace()
     performanceMessage.value = `缓存已重建，清理文件 ${removed} 个，已按当前策略重新开始预热。`

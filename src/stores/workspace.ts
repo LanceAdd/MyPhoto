@@ -182,6 +182,26 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     if (token) token.cancelled = true
     warmupTokensByWorkspace.delete(workspaceId)
     warmupBatchContextByWorkspace.delete(workspaceId)
+    void invoke('cancel_warmup', { workspaceId }).catch(() => {})
+    const tab = getTabByWorkspaceId(workspaceId)
+    if (tab) {
+      tab.warmupRunning = false
+      tab.warmupCurrent = null
+    }
+  }
+
+  async function cancelAllWarmupPipelines() {
+    for (const workspaceId of warmupTokensByWorkspace.keys()) {
+      const token = warmupTokensByWorkspace.get(workspaceId)
+      if (token) token.cancelled = true
+    }
+    warmupTokensByWorkspace.clear()
+    warmupBatchContextByWorkspace.clear()
+    for (const t of tabs.value) {
+      t.warmupRunning = false
+      t.warmupCurrent = null
+    }
+    await invoke('cancel_all_warmups').catch(() => {})
   }
 
   function showWarmupPopup(workspaceId?: number, minimized = warmupPopupMinimized.value) {
@@ -422,6 +442,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
     tabs.value.push(tab)
     activeTabIndex.value = tabs.value.length - 1
+    warmupTargetTotalByWorkspace.set(ws.id, Math.max(0, ws.photo_count ?? 0))
 
     const tabIndex = activeTabIndex.value
     void loadPhotos(tabIndex, { refreshMeta: true })
@@ -1127,6 +1148,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     setViewMode,
     setCullIndex,
     restartWarmupForActiveWorkspace,
+    cancelAllWarmupPipelines,
     warmupPopupVisible,
     warmupPopupMinimized,
     warmupPopupWorkspaceId,

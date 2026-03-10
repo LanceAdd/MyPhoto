@@ -57,7 +57,7 @@
               class="inline-star"
               :class="{ filled: n <= currentPhoto.star_rating }"
               @click.stop="setStar(n)"
-            >*</span>
+            >★</span>
           </div>
           <span class="info-sep">|</span>
           <div class="inline-colors">
@@ -95,7 +95,7 @@
         @click="goTo(i)"
       >
         <RailThumb :photo="photo" :workspace-path="tab?.workspace.path ?? ''" />
-        <div v-if="photo.star_rating > 0" class="rail-star">{{ '*'.repeat(photo.star_rating) }}</div>
+        <div v-if="photo.star_rating > 0" class="rail-star">{{ '★'.repeat(photo.star_rating) }}</div>
         <div
           v-if="photo.color_label"
           class="rail-color"
@@ -511,7 +511,13 @@ onUnmounted(() => {
 .info-name { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #ddd; }
 .info-sep { color: #444; }
 .inline-stars { display: flex; gap: 3px; }
-.inline-star { font-size: 16px; cursor: pointer; color: #555; transition: color 0.1s; }
+.inline-star {
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  color: #555;
+  transition: color 0.1s;
+}
 .inline-star:hover, .inline-star.filled { color: #f39c12; }
 .inline-colors { display: flex; gap: 4px; align-items: center; }
 .inline-color { width: 14px; height: 14px; border-radius: 50%; cursor: pointer; border: 2px solid transparent; transition: border-color 0.1s; }
@@ -554,9 +560,10 @@ onUnmounted(() => {
   position: absolute;
   bottom: 2px;
   right: 2px;
-  font-size: 8px;
+  font-size: 11px;
+  line-height: 1;
   color: #f39c12;
-  letter-spacing: -1px;
+  letter-spacing: -0.5px;
   text-shadow: 0 1px 2px #000;
 }
 .rail-color {

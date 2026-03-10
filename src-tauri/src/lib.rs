@@ -30,6 +30,31 @@ async fn open_workspace(
     let scan_path = path.clone();
     tokio::spawn(async move {
         let app_for_progress = app_for_emit.clone();
+        let _ = app_for_progress.emit(
+            "scan-progress",
+            serde_json::json!({
+                "workspace_id": ws_id,
+                "phase": "quick_check",
+                "done": 0,
+                "total": 0,
+                "current_path": null,
+            }),
+        );
+        match photos::should_scan_workspace_on_open(ws_id, &scan_path) {
+            Ok(false) => {
+                let count = photos::get_workspace_present_photo_count(ws_id).unwrap_or(0);
+                let _ = app_for_emit.emit(
+                    "scan-complete",
+                    serde_json::json!({
+                        "workspace_id": ws_id,
+                        "count": count
+                    }),
+                );
+                return;
+            }
+            Ok(true) => {}
+            Err(_) => {}
+        }
         match photos::scan_workspace_with_progress(ws_id, &scan_path, |progress| {
             let _ = app_for_progress.emit(
                 "scan-progress",
@@ -197,6 +222,18 @@ async fn warmup_previews(
             );
         },
     )
+}
+
+#[tauri::command]
+async fn cancel_warmup(workspace_id: i64) -> Result<(), String> {
+    imaging::request_cancel_warmup(workspace_id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_all_warmups() -> Result<(), String> {
+    imaging::request_cancel_all_warmups();
+    Ok(())
 }
 
 #[tauri::command]
@@ -611,6 +648,8 @@ pub fn run() {
             get_workspace_files,
             ensure_preview_cache,
             warmup_previews,
+            cancel_warmup,
+            cancel_all_warmups,
             rebuild_preview_cache,
             get_preview_cache_info,
             get_thumbnail_perf_stats,

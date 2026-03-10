@@ -111,6 +111,74 @@ fn should_emit_progress(done: usize, total: usize) -> bool {
     done == 0 || done == total || done <= 5 || done % 25 == 0
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WorkspaceSignature {
+    count: usize,
+    total_size: i64,
+    max_modified_at: Option<String>,
+}
+
+fn workspace_signature_matches(db: &WorkspaceSignature, fs: &WorkspaceSignature) -> bool {
+    db.count == fs.count
+        && db.total_size == fs.total_size
+        && db.max_modified_at.as_deref() == fs.max_modified_at.as_deref()
+}
+
+fn load_workspace_signature_from_db(workspace_id: i64) -> Result<WorkspaceSignature, String> {
+    with_db(|conn| {
+        let sig = conn.query_row(
+            "SELECT
+                COUNT(*) as count,
+                COALESCE(SUM(COALESCE(file_size, 0)), 0) as total_size,
+                MAX(file_modified_at) as max_modified_at
+             FROM photos
+             WHERE workspace_id = ?1 AND is_missing = 0",
+            params![workspace_id],
+            |r| {
+                let count: i64 = r.get(0)?;
+                let total_size: i64 = r.get(1)?;
+                let max_modified_at: Option<String> = r.get(2)?;
+                Ok(WorkspaceSignature {
+                    count: count.max(0) as usize,
+                    total_size,
+                    max_modified_at,
+                })
+            },
+        )?;
+        Ok(sig)
+    })
+    .map_err(|e| e.to_string())
+}
+
+fn probe_workspace_signature(root_path: &str) -> Result<WorkspaceSignature, String> {
+    let root = PathBuf::from(root_path);
+    if !root.exists() {
+        return Ok(WorkspaceSignature::default());
+    }
+
+    let mut sig = WorkspaceSignature::default();
+    for entry in WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file() && is_image(e.path()))
+    {
+        sig.count += 1;
+        let (file_size, file_modified_at) = metadata_signature(entry.path());
+        sig.total_size = sig.total_size.saturating_add(file_size.unwrap_or(0));
+        if file_modified_at.as_deref() > sig.max_modified_at.as_deref() {
+            sig.max_modified_at = file_modified_at;
+        }
+    }
+    Ok(sig)
+}
+
+pub fn should_scan_workspace_on_open(workspace_id: i64, root_path: &str) -> Result<bool, String> {
+    let db_sig = load_workspace_signature_from_db(workspace_id)?;
+    let fs_sig = probe_workspace_signature(root_path)?;
+    Ok(!workspace_signature_matches(&db_sig, &fs_sig))
+}
+
 pub fn open_or_create_workspace(path: &str) -> Result<Workspace, String> {
     let name = Path::new(path)
         .file_name()
@@ -1423,7 +1491,8 @@ pub fn batch_rename_workspace_photos(
 mod tests {
     use super::{
         decide_scan_action, filename_extension_with_dot, format_batch_rename_filename,
-        should_emit_progress, ExistingPhotoState, ScanAction,
+        should_emit_progress, workspace_signature_matches, ExistingPhotoState, ScanAction,
+        WorkspaceSignature,
     };
 
     fn existing(
@@ -1489,6 +1558,36 @@ mod tests {
         assert!(should_emit_progress(25, 100));
         assert!(should_emit_progress(100, 100));
         assert!(!should_emit_progress(26, 100));
+    }
+
+    #[test]
+    fn workspace_signature_matches_when_all_fields_equal() {
+        let left = WorkspaceSignature {
+            count: 12,
+            total_size: 456_789,
+            max_modified_at: Some("2026-03-10T09:01:02+00:00".to_string()),
+        };
+        let right = WorkspaceSignature {
+            count: 12,
+            total_size: 456_789,
+            max_modified_at: Some("2026-03-10T09:01:02+00:00".to_string()),
+        };
+        assert!(workspace_signature_matches(&left, &right));
+    }
+
+    #[test]
+    fn workspace_signature_detects_difference() {
+        let base = WorkspaceSignature {
+            count: 12,
+            total_size: 456_789,
+            max_modified_at: Some("2026-03-10T09:01:02+00:00".to_string()),
+        };
+        let changed = WorkspaceSignature {
+            count: 13,
+            total_size: 456_789,
+            max_modified_at: Some("2026-03-10T09:01:02+00:00".to_string()),
+        };
+        assert!(!workspace_signature_matches(&base, &changed));
     }
 
     #[test]

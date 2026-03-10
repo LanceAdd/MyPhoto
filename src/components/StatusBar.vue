@@ -48,10 +48,11 @@ function openWarmupPopup() {
 
 function scanPhaseLabel(phase?: string) {
   switch (phase) {
-    case 'scan_files': return '扫描文件'
+    case 'quick_check': return '快速校验'
+    case 'scan_files': return '同步索引'
     case 'write_database': return '写入索引'
-    case 'mark_missing': return '标记缺失'
-    case 'done': return '扫描完成'
+    case 'mark_missing': return '校正缺失'
+    case 'done': return '索引完成'
     default: return '后台任务'
   }
 }

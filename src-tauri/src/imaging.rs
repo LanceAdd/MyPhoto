@@ -4,11 +4,12 @@ use chrono::Local;
 use image::{imageops::FilterType, DynamicImage};
 use rusqlite::params;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, UNIX_EPOCH};
 use walkdir::WalkDir;
@@ -42,6 +43,44 @@ pub struct ThumbnailPerfStats {
 fn thumb_perf_stats() -> &'static Mutex<ThumbnailPerfStats> {
     static STATS: OnceLock<Mutex<ThumbnailPerfStats>> = OnceLock::new();
     STATS.get_or_init(|| Mutex::new(ThumbnailPerfStats::default()))
+}
+
+fn warmup_cancel_generations() -> &'static Mutex<HashMap<i64, Arc<AtomicU64>>> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<i64, Arc<AtomicU64>>>> = OnceLock::new();
+    GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn warmup_generation_counter(workspace_id: i64) -> Arc<AtomicU64> {
+    let mut guard = warmup_cancel_generations()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(workspace_id)
+        .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+        .clone()
+}
+
+fn current_warmup_generation(workspace_id: i64) -> u64 {
+    warmup_generation_counter(workspace_id).load(Ordering::SeqCst)
+}
+
+pub fn request_cancel_warmup(workspace_id: i64) {
+    if workspace_id <= 0 {
+        return;
+    }
+    warmup_generation_counter(workspace_id).fetch_add(1, Ordering::SeqCst);
+}
+
+pub fn request_cancel_all_warmups() {
+    let counters: Vec<Arc<AtomicU64>> = {
+        let guard = warmup_cancel_generations()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.values().cloned().collect()
+    };
+    for counter in counters {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 fn u128_to_u64_saturating(value: u128) -> u64 {
@@ -201,6 +240,8 @@ where
         return Err("invalid workspace id for warmup".to_string());
     }
 
+    let generation_counter = warmup_generation_counter(workspace_id);
+    let expected_generation = current_warmup_generation(workspace_id);
     let files = crate::photos::get_workspace_files_page(workspace_id, offset, limit)?;
     let total = files.len();
     on_progress(WarmupProgress {
@@ -248,8 +289,13 @@ where
         let workspace_path_ref = workspace_path_owned.clone();
         let primary_profile_ref = primary_profile_owned.clone();
         let secondary_variant_ref = secondary_variant_owned.clone();
+        let generation_counter_ref = Arc::clone(&generation_counter);
+        let expected_generation_ref = expected_generation;
         std::thread::spawn(move || {
             loop {
+                if generation_counter_ref.load(Ordering::SeqCst) != expected_generation_ref {
+                    break;
+                }
                 let idx = next_idx_ref.fetch_add(1, Ordering::Relaxed);
                 if idx >= files_ref.len() {
                     break;
@@ -275,6 +321,9 @@ where
     let mut warmed = 0usize;
     let mut done = 0usize;
     for (ok, filename) in result_rx {
+        if generation_counter.load(Ordering::SeqCst) != expected_generation {
+            break;
+        }
         if ok {
             warmed += 1;
         }
@@ -287,7 +336,16 @@ where
             finished: done >= total,
         });
     }
-    Ok(total)
+    if generation_counter.load(Ordering::SeqCst) != expected_generation {
+        on_progress(WarmupProgress {
+            done,
+            total,
+            succeeded: warmed,
+            current_file: None,
+            finished: true,
+        });
+    }
+    Ok(done)
 }
 
 pub fn normalize_warmup_concurrency(concurrency: usize) -> usize {
@@ -1010,6 +1068,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(cache_root);
         std::env::remove_var("MYPHOTO_THUMB_CACHE_ROOT");
+    }
+
+    #[test]
+    fn request_cancel_warmup_advances_generation() {
+        let workspace_id = 987654321_i64;
+        let before = super::current_warmup_generation(workspace_id);
+        super::request_cancel_warmup(workspace_id);
+        let after = super::current_warmup_generation(workspace_id);
+        assert!(after > before);
     }
 
     #[test]

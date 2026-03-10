@@ -99,13 +99,13 @@
 
     <!-- Scanning indicator -->
     <div v-if="tab?.scanning" class="scanning-banner">
-      <span class="spin">⟳</span> 正在扫描照片...
+      <span class="spin">⟳</span> 正在同步文件索引...
     </div>
 
     <!-- Empty -->
     <div v-if="photos.length === 0" class="empty">
       <span>📷</span>
-      <p v-if="tab?.scanning">正在扫描照片...</p>
+      <p v-if="tab?.scanning">正在同步文件索引...</p>
       <p v-else-if="activeFilterCount > 0">当前筛选无结果，请调整筛选条件</p>
       <p v-else>此文件夹中没有照片</p>
     </div>
