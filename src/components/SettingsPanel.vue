@@ -71,6 +71,10 @@
               <span>占用大小</span>
               <strong>{{ cacheInfoLoading ? '计算中...' : formatBytes(cacheSizeBytes) }}</strong>
             </div>
+            <div class="cache-info-row">
+              <span>大小上限</span>
+              <strong>{{ formatBytes(mbToBytes(cacheMaxSizeMb)) }}</strong>
+            </div>
             <div class="cache-profiles">
               <div class="cache-profiles-title">分组占用</div>
               <div v-if="cacheProfileEntries.length === 0" class="cache-profile-row">
@@ -83,7 +87,14 @@
               </div>
             </div>
           </div>
+          <div class="form-row">
+            <label>缓存上限（MB）</label>
+            <input v-model.number="cacheMaxSizeMb" type="number" min="512" max="65536" step="256" />
+          </div>
           <div class="actions">
+            <button class="primary" :disabled="savingCacheBudget" @click="saveCacheBudget">
+              {{ savingCacheBudget ? '保存中...' : '保存缓存上限' }}
+            </button>
             <button :disabled="cacheInfoLoading" @click="loadCacheInfo">
               {{ cacheInfoLoading ? '刷新中...' : '刷新缓存信息' }}
             </button>
@@ -155,6 +166,7 @@ interface PreviewCacheInfo {
   path: string
   size_bytes: number
   profile_sizes?: Record<string, number>
+  max_size_bytes?: number
 }
 
 const emit = defineEmits<{ close: [] }>()
@@ -176,8 +188,10 @@ const cacheInfoLoading = ref(false)
 const openingCacheFolder = ref(false)
 const cachePath = ref('')
 const cacheSizeBytes = ref<number | null>(null)
+const cacheMaxSizeMb = ref(8 * 1024)
 const cacheProfileSizes = ref<Record<string, number>>({})
 const cacheProfileEntries = computed(() => Object.entries(cacheProfileSizes.value).sort((a, b) => b[1] - a[1]))
+const savingCacheBudget = ref(false)
 
 const appName = ref('MyPhoto')
 const appVersion = ref('-')
@@ -206,6 +220,10 @@ function formatBytes(bytes: number | null) {
   return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[idx]}`
 }
 
+function mbToBytes(mb: number) {
+  return Math.max(0, Math.round(mb)) * 1024 * 1024
+}
+
 function formatProfileName(raw: string) {
   if (!raw) return '未分类'
   if (raw === 'legacy') return 'Legacy/未分组'
@@ -219,6 +237,7 @@ async function loadCacheInfo() {
     cachePath.value = info.path ?? ''
     cacheSizeBytes.value = Number.isFinite(info.size_bytes) ? info.size_bytes : 0
     cacheProfileSizes.value = info.profile_sizes ?? {}
+    cacheMaxSizeMb.value = Math.max(512, Math.round((info.max_size_bytes ?? (8 * 1024 * 1024 * 1024)) / (1024 * 1024)))
   } catch (e) {
     cachePath.value = ''
     cacheSizeBytes.value = null
@@ -226,6 +245,25 @@ async function loadCacheInfo() {
     performanceMessage.value = `读取缓存信息失败：${String(e)}`
   } finally {
     cacheInfoLoading.value = false
+  }
+}
+
+async function saveCacheBudget() {
+  savingCacheBudget.value = true
+  performanceMessage.value = ''
+  try {
+    const info: PreviewCacheInfo = await invoke('set_preview_cache_max_size_mb', {
+      maxSizeMb: cacheMaxSizeMb.value,
+    })
+    cachePath.value = info.path ?? ''
+    cacheSizeBytes.value = Number.isFinite(info.size_bytes) ? info.size_bytes : 0
+    cacheProfileSizes.value = info.profile_sizes ?? {}
+    cacheMaxSizeMb.value = Math.max(512, Math.round((info.max_size_bytes ?? mbToBytes(cacheMaxSizeMb.value)) / (1024 * 1024)))
+    performanceMessage.value = '缓存大小上限已保存，并已尝试自动回收超限文件。'
+  } catch (e) {
+    performanceMessage.value = `保存缓存上限失败：${String(e)}`
+  } finally {
+    savingCacheBudget.value = false
   }
 }
 
