@@ -28,6 +28,12 @@ pub struct PreviewCacheInfo {
     pub path: String,
     pub size_bytes: u64,
     pub profile_sizes: BTreeMap<String, u64>,
+    pub max_size_bytes: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PreviewCacheSettings {
+    pub max_size_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -43,6 +49,16 @@ pub struct ThumbnailPerfStats {
 fn thumb_perf_stats() -> &'static Mutex<ThumbnailPerfStats> {
     static STATS: OnceLock<Mutex<ThumbnailPerfStats>> = OnceLock::new();
     STATS.get_or_init(|| Mutex::new(ThumbnailPerfStats::default()))
+}
+
+const DEFAULT_PREVIEW_CACHE_MAX_SIZE_MB: u64 = 8 * 1024;
+const MIN_PREVIEW_CACHE_MAX_SIZE_MB: u64 = 512;
+const MAX_PREVIEW_CACHE_MAX_SIZE_MB: u64 = 64 * 1024;
+const CACHE_TRIM_WRITE_INTERVAL: usize = 8;
+
+fn preview_cache_trim_counter() -> &'static AtomicUsize {
+    static COUNTER: OnceLock<AtomicUsize> = OnceLock::new();
+    COUNTER.get_or_init(|| AtomicUsize::new(0))
 }
 
 fn warmup_cancel_generations() -> &'static Mutex<HashMap<i64, Arc<AtomicU64>>> {
@@ -402,6 +418,114 @@ fn thumbnail_cache_root() -> Option<PathBuf> {
     dirs_next::data_local_dir().map(|d| d.join("myphoto").join("thumb_cache"))
 }
 
+fn preview_cache_settings_path() -> Option<PathBuf> {
+    let root = thumbnail_cache_root()?;
+    let base = root.parent().unwrap_or(root.as_path());
+    Some(base.join("preview_cache_settings.json"))
+}
+
+fn preview_cache_default_settings() -> PreviewCacheSettings {
+    PreviewCacheSettings {
+        max_size_bytes: DEFAULT_PREVIEW_CACHE_MAX_SIZE_MB * 1024 * 1024,
+    }
+}
+
+fn normalize_preview_cache_max_size_mb(value: u64) -> u64 {
+    value.clamp(
+        MIN_PREVIEW_CACHE_MAX_SIZE_MB,
+        MAX_PREVIEW_CACHE_MAX_SIZE_MB,
+    )
+}
+
+fn read_preview_cache_settings() -> PreviewCacheSettings {
+    let Some(path) = preview_cache_settings_path() else {
+        return preview_cache_default_settings();
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return preview_cache_default_settings();
+    };
+    let Ok(parsed) = serde_json::from_str::<PreviewCacheSettings>(&raw) else {
+        return preview_cache_default_settings();
+    };
+    PreviewCacheSettings {
+        max_size_bytes: normalize_preview_cache_max_size_mb(
+            (parsed.max_size_bytes / (1024 * 1024)).max(1),
+        ) * 1024
+            * 1024,
+    }
+}
+
+pub fn set_preview_cache_max_size_mb(max_size_mb: u64) -> Result<PreviewCacheSettings, String> {
+    let normalized_mb = normalize_preview_cache_max_size_mb(max_size_mb);
+    let settings = PreviewCacheSettings {
+        max_size_bytes: normalized_mb * 1024 * 1024,
+    };
+    let path = preview_cache_settings_path().ok_or_else(|| "cache settings path unavailable".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let raw = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(&path, raw).map_err(|e| e.to_string())?;
+
+    if let Some(root) = thumbnail_cache_root() {
+        let _ = trim_preview_cache_to_budget(&root, settings.max_size_bytes);
+    }
+
+    Ok(settings)
+}
+
+fn maybe_trim_preview_cache(root: &Path) {
+    let tick = preview_cache_trim_counter().fetch_add(1, Ordering::SeqCst) + 1;
+    if tick % CACHE_TRIM_WRITE_INTERVAL != 0 {
+        return;
+    }
+    let settings = read_preview_cache_settings();
+    let _ = trim_preview_cache_to_budget(root, settings.max_size_bytes);
+}
+
+fn trim_preview_cache_to_budget(root: &Path, max_size_bytes: u64) -> Result<usize, String> {
+    if !root.exists() {
+        return Ok(0);
+    }
+
+    let mut files: Vec<(PathBuf, u64, u128)> = Vec::new();
+    let mut total_size = 0u64;
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let meta = entry.metadata().map_err(|e| e.to_string())?;
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|dur| dur.as_nanos())
+            .unwrap_or(0);
+        let len = meta.len();
+        total_size = total_size.saturating_add(len);
+        files.push((entry.path().to_path_buf(), len, modified));
+    }
+
+    if total_size <= max_size_bytes {
+        return Ok(0);
+    }
+
+    files.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+
+    let mut removed = 0usize;
+    for (path, len, _) in files {
+        if total_size <= max_size_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total_size = total_size.saturating_sub(len);
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
+}
+
 fn try_read_cached_thumbnail(cache_path: &Path) -> Option<Vec<u8>> {
     let bytes = std::fs::read(cache_path).ok()?;
     if bytes.is_empty() {
@@ -418,6 +542,9 @@ fn write_cached_thumbnail(cache_path: &Path, bytes: &[u8]) {
         }
     }
     let _ = std::fs::write(cache_path, bytes);
+    if let Some(root) = thumbnail_cache_root() {
+        maybe_trim_preview_cache(&root);
+    }
 }
 
 fn build_cache_key_v2(
@@ -636,6 +763,7 @@ pub fn get_preview_cache_info() -> Result<PreviewCacheInfo, String> {
         std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     }
 
+    let settings = read_preview_cache_settings();
     let profile_sizes = compute_profile_size_bytes(&root);
     let size_bytes = profile_sizes
         .values()
@@ -645,6 +773,7 @@ pub fn get_preview_cache_info() -> Result<PreviewCacheInfo, String> {
         path: root.to_string_lossy().to_string(),
         size_bytes,
         profile_sizes,
+        max_size_bytes: settings.max_size_bytes,
     })
 }
 
@@ -885,12 +1014,15 @@ mod tests {
     use super::build_cache_key_v2;
     use super::ensure_preview_cache_path;
     use super::get_thumbnail_perf_stats;
+    use super::normalize_preview_cache_max_size_mb;
     use super::normalize_warmup_concurrency;
+    use super::trim_preview_cache_to_budget;
     use super::warmup_preview_cache_with_progress;
     use image::{ImageBuffer, Rgb};
     use rusqlite::params;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
     use std::time::Instant;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -911,6 +1043,13 @@ mod tests {
         assert!(json.get("generated").is_some());
         assert!(json.get("cache_hits").is_some());
         assert!(json.get("decode_ms_total").is_some());
+    }
+
+    #[test]
+    fn preview_cache_budget_is_clamped_to_safe_bounds() {
+        assert_eq!(normalize_preview_cache_max_size_mb(1), 512);
+        assert_eq!(normalize_preview_cache_max_size_mb(8 * 1024), 8 * 1024);
+        assert_eq!(normalize_preview_cache_max_size_mb(128 * 1024), 64 * 1024);
     }
 
     #[test]
@@ -1077,6 +1216,29 @@ mod tests {
         super::request_cancel_warmup(workspace_id);
         let after = super::current_warmup_generation(workspace_id);
         assert!(after > before);
+    }
+
+    #[test]
+    fn trim_preview_cache_removes_oldest_files_first() {
+        let cache_root = create_cache_root();
+        let oldest = cache_root.join("a.jpg");
+        let middle = cache_root.join("b.jpg");
+        let newest = cache_root.join("c.jpg");
+
+        std::fs::write(&oldest, vec![0u8; 10]).expect("write oldest");
+        std::thread::sleep(Duration::from_millis(15));
+        std::fs::write(&middle, vec![1u8; 10]).expect("write middle");
+        std::thread::sleep(Duration::from_millis(15));
+        std::fs::write(&newest, vec![2u8; 10]).expect("write newest");
+
+        let removed = trim_preview_cache_to_budget(&cache_root, 15).expect("trim to budget");
+
+        assert_eq!(removed, 2);
+        assert!(!oldest.exists());
+        assert!(!middle.exists());
+        assert!(newest.exists());
+
+        let _ = std::fs::remove_dir_all(cache_root);
     }
 
     #[test]

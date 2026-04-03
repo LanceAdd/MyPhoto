@@ -247,6 +247,14 @@ async fn get_preview_cache_info() -> Result<imaging::PreviewCacheInfo, String> {
 }
 
 #[tauri::command]
+async fn set_preview_cache_max_size_mb(
+    max_size_mb: u64,
+) -> Result<imaging::PreviewCacheInfo, String> {
+    imaging::set_preview_cache_max_size_mb(max_size_mb)?;
+    imaging::get_preview_cache_info()
+}
+
+#[tauri::command]
 async fn get_thumbnail_perf_stats() -> Result<imaging::ThumbnailPerfStats, String> {
     Ok(imaging::get_thumbnail_perf_stats())
 }
@@ -652,6 +660,7 @@ pub fn run() {
             cancel_all_warmups,
             rebuild_preview_cache,
             get_preview_cache_info,
+            set_preview_cache_max_size_mb,
             get_thumbnail_perf_stats,
             update_photo_meta,
             batch_update_meta,

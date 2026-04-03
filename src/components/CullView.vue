@@ -39,6 +39,9 @@
             :style="previewTransformStyle"
             draggable="false"
           />
+          <div v-if="showTransitionOverlay" class="preview-transition">
+            <div class="loading-spin">加载中</div>
+          </div>
           <div v-else-if="currentPhoto?.is_missing" class="preview-missing">文件已丢失</div>
           <div v-else class="preview-loading">
             <div class="loading-spin">加载中</div>
@@ -108,10 +111,10 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
 import { useWorkspaceStore } from '../stores/workspace'
 import RailThumb from './RailThumb.vue'
-import { toTauriImageSrc } from '../utils/image-src'
+import { sharedViewerImagePipeline } from '../utils/viewer-image-runtime'
+import type { ViewerImageSnapshot } from '../utils/viewer-image-pipeline'
 
 const store = useWorkspaceStore()
 const tab = computed(() => store.activeTab)
@@ -125,15 +128,13 @@ const currentPhoto = computed(() => photos.value[currentIndex.value] ?? null)
 const cullRef = ref<HTMLElement>()
 const railRef = ref<HTMLElement>()
 const previewSrc = ref<string | null>(null)
-const loadSeq = ref(0)
+const previewLoading = ref(false)
+const displayedPhotoPath = ref<string | null>(null)
 const scale = ref(1)
 const rotation = ref(0)
 const translateX = ref(0)
 const translateY = ref(0)
-
-const PREVIEW_SIZE = 1600
-const PREVIEW_PROFILE = 'preview'
-const PREVIEW_QUALITY = 82
+let stopViewerSubscription: (() => void) | null = null
 
 const normalizedRotation = computed(() => {
   const v = rotation.value % 360
@@ -197,12 +198,53 @@ function fullPathOf(index: number) {
   return `${root}/${photo.relative_path}`
 }
 
-function preloadImage(src: string) {
-  return new Promise<boolean>((resolve) => {
-    const img = new Image()
-    img.onload = () => resolve(true)
-    img.onerror = () => resolve(false)
-    img.src = src
+const currentFullPath = computed(() => fullPathOf(currentIndex.value))
+const orderedPhotoPaths = computed(() =>
+  photos.value
+    .map((_, index) => fullPathOf(index))
+    .filter((path): path is string => !!path)
+)
+const showTransitionOverlay = computed(() =>
+  !!previewSrc.value
+  && !!currentFullPath.value
+  && displayedPhotoPath.value !== currentFullPath.value
+  && !currentPhoto.value?.is_missing
+)
+
+function disconnectViewer() {
+  stopViewerSubscription?.()
+  stopViewerSubscription = null
+}
+
+function applyViewerSnapshot(path: string, snapshot: ViewerImageSnapshot) {
+  if (currentFullPath.value !== path) return
+  previewLoading.value = snapshot.isLoading
+  if (snapshot.displaySrc) {
+    previewSrc.value = snapshot.displaySrc
+    displayedPhotoPath.value = path
+    return
+  }
+  if (displayedPhotoPath.value === path) {
+    previewSrc.value = null
+    displayedPhotoPath.value = null
+  }
+}
+
+function connectViewer(path: string | null) {
+  disconnectViewer()
+  if (!path || currentPhoto.value?.is_missing) {
+    previewSrc.value = null
+    previewLoading.value = false
+    displayedPhotoPath.value = path
+    return
+  }
+
+  stopViewerSubscription = sharedViewerImagePipeline.subscribe(path, (snapshot) => {
+    applyViewerSnapshot(path, snapshot)
+  })
+  sharedViewerImagePipeline.focus({
+    activePath: path,
+    orderedPaths: orderedPhotoPaths.value,
   })
 }
 
@@ -229,78 +271,15 @@ function onPreviewWheel(e: WheelEvent) {
   const delta = e.deltaY > 0 ? (1 / 1.12) : 1.12
   zoomBy(delta)
 }
-
-async function loadPreview() {
-  const seq = ++loadSeq.value
-  const photo = currentPhoto.value
-  if (!photo || photo.is_missing) {
-    previewSrc.value = null
-    return
-  }
+watch([currentFullPath, orderedPhotoPaths], ([path]) => {
   resetTransform()
-  previewSrc.value = null
-
-  const fullPath = fullPathOf(currentIndex.value)
-  if (!fullPath) return
-
-  let showedPreview = false
-  try {
-    const cachedPath: string = await invoke('ensure_preview_cache', {
-      photoPath: fullPath,
-      size: PREVIEW_SIZE,
-      profile: PREVIEW_PROFILE,
-      quality: PREVIEW_QUALITY,
-    })
-    if (seq !== loadSeq.value) return
-    const src = toTauriImageSrc(cachedPath)
-    const ready = await preloadImage(src)
-    if (seq !== loadSeq.value) return
-    if (ready) {
-      previewSrc.value = src
-      showedPreview = true
-    }
-  } catch {
-    // keep fallback logic below
-  }
-
-  const originalSrc = toTauriImageSrc(fullPath)
-  const originalReady = await preloadImage(originalSrc)
-  if (seq !== loadSeq.value) return
-  if (originalReady) {
-    previewSrc.value = originalSrc
-    return
-  }
-
-  if (!showedPreview) previewSrc.value = null
-}
-
-function prefetchNeighbors(center: number) {
-  const offsets = [-2, -1, 1, 2]
-  for (const offset of offsets) {
-    const idx = center + offset
-    if (idx < 0 || idx >= photos.value.length) continue
-    const photo = photos.value[idx]
-    if (!photo || photo.is_missing) continue
-    const fullPath = fullPathOf(idx)
-    if (!fullPath) continue
-
-    void invoke('ensure_preview_cache', {
-      photoPath: fullPath,
-      size: PREVIEW_SIZE,
-      profile: PREVIEW_PROFILE,
-      quality: PREVIEW_QUALITY,
-    }).catch(() => {})
-
-    if (Math.abs(offset) === 1) {
-      void preloadImage(toTauriImageSrc(fullPath))
-    }
-  }
-}
-
-watch(currentIndex, (idx) => {
-  void loadPreview()
-  prefetchNeighbors(idx)
+  connectViewer(path)
 }, { immediate: true })
+watch(scale, (nextScale) => {
+  const path = currentFullPath.value
+  if (!path || nextScale <= 1) return
+  sharedViewerImagePipeline.setZoom(path, nextScale)
+})
 watch(() => photos.value.length, () => {
   if (currentIndex.value >= photos.value.length) {
     store.setCullIndex(Math.max(0, photos.value.length - 1))
@@ -373,7 +352,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  loadSeq.value += 1
+  disconnectViewer()
 })
 </script>
 
@@ -474,6 +453,7 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   overflow: hidden;
+  position: relative;
 }
 .preview-img {
   max-width: 100%;
@@ -481,6 +461,16 @@ onUnmounted(() => {
   object-fit: contain;
   transition: transform 0.08s;
   user-select: none;
+}
+.preview-transition {
+  position: absolute;
+  right: 16px;
+  top: 16px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.5);
+  color: #9aa8bc;
+  font-size: 12px;
 }
 .preview-missing {
   font-size: 36px;

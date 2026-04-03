@@ -29,6 +29,7 @@
           :style="imgTransformStyle"
           draggable="false"
         />
+        <div v-if="showTransitionOverlay" class="lb-transition">加载中</div>
         <div v-else-if="currentPhoto?.is_missing" class="lb-missing">文件已丢失</div>
         <div v-else class="lb-loading">
           <div class="spin">⟳</div>
@@ -76,9 +77,9 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
 import { useWorkspaceStore, type Photo } from '../stores/workspace'
-import { toTauriImageSrc } from '../utils/image-src'
+import { sharedViewerImagePipeline } from '../utils/viewer-image-runtime'
+import type { ViewerImageSnapshot } from '../utils/viewer-image-pipeline'
 
 const props = defineProps<{ photo: Photo }>()
 const emit = defineEmits<{ close: [] }>()
@@ -87,18 +88,26 @@ const store = useWorkspaceStore()
 const allPhotos = computed(() => store.activeTab?.photos ?? [])
 const currentIndex = ref(Math.max(0, allPhotos.value.findIndex(p => p.id === props.photo.id)))
 const currentPhoto = computed(() => allPhotos.value[currentIndex.value] ?? null)
+const currentFullPath = computed(() => {
+  const photo = currentPhoto.value
+  if (!photo) return null
+  return fullPathOf(photo)
+})
+const orderedPhotoPaths = computed(() =>
+  allPhotos.value
+    .map(photo => fullPathOf(photo))
+    .filter((path): path is string => !!path)
+)
 
 const boxRef = ref<HTMLElement>()
 const imgSrc = ref<string | null>(null)
-const loadSeq = ref(0)
+const imageLoading = ref(false)
+const displayedPhotoPath = ref<string | null>(null)
 const scale = ref(1)
 const rotation = ref(0)
 const translateX = ref(0)
 const translateY = ref(0)
-
-const PREVIEW_SIZE = 1600
-const PREVIEW_PROFILE = 'preview'
-const PREVIEW_QUALITY = 82
+let stopViewerSubscription: (() => void) | null = null
 
 const normalizedRotation = computed(() => {
   const v = rotation.value % 360
@@ -177,87 +186,59 @@ function fullPathOf(photo: Photo): string | null {
   if (!root) return null
   return `${root}/${photo.relative_path}`
 }
+const showTransitionOverlay = computed(() =>
+  !!imgSrc.value
+  && !!currentFullPath.value
+  && displayedPhotoPath.value !== currentFullPath.value
+  && !currentPhoto.value?.is_missing
+)
 
-function preloadImage(src: string) {
-  return new Promise<boolean>((resolve) => {
-    const img = new Image()
-    img.onload = () => resolve(true)
-    img.onerror = () => resolve(false)
-    img.src = src
+function disconnectViewer() {
+  stopViewerSubscription?.()
+  stopViewerSubscription = null
+}
+
+function applyViewerSnapshot(path: string, snapshot: ViewerImageSnapshot) {
+  if (currentFullPath.value !== path) return
+  imageLoading.value = snapshot.isLoading
+  if (snapshot.displaySrc) {
+    imgSrc.value = snapshot.displaySrc
+    displayedPhotoPath.value = path
+    return
+  }
+  if (displayedPhotoPath.value === path) {
+    imgSrc.value = null
+    displayedPhotoPath.value = null
+  }
+}
+
+function connectViewer(path: string | null) {
+  disconnectViewer()
+  if (!path || currentPhoto.value?.is_missing) {
+    imgSrc.value = null
+    imageLoading.value = false
+    displayedPhotoPath.value = path
+    return
+  }
+
+  stopViewerSubscription = sharedViewerImagePipeline.subscribe(path, (snapshot) => {
+    applyViewerSnapshot(path, snapshot)
+  })
+  sharedViewerImagePipeline.focus({
+    activePath: path,
+    orderedPaths: orderedPhotoPaths.value,
   })
 }
 
-function prefetchNeighbors(center: number) {
-  const offsets = [-2, -1, 1, 2]
-  for (const offset of offsets) {
-    const idx = center + offset
-    if (idx < 0 || idx >= allPhotos.value.length) continue
-    const photo = allPhotos.value[idx]
-    if (!photo || photo.is_missing) continue
-    const fullPath = fullPathOf(photo)
-    if (!fullPath) continue
-
-    void invoke('ensure_preview_cache', {
-      photoPath: fullPath,
-      size: PREVIEW_SIZE,
-      profile: PREVIEW_PROFILE,
-      quality: PREVIEW_QUALITY,
-    }).catch(() => {})
-
-    if (Math.abs(offset) === 1) {
-      void preloadImage(toTauriImageSrc(fullPath))
-    }
-  }
-}
-
-async function loadImage() {
-  const seq = ++loadSeq.value
-  const photo = currentPhoto.value
-  if (!photo || photo.is_missing) {
-    imgSrc.value = null
-    return
-  }
+watch([currentFullPath, orderedPhotoPaths], ([path]) => {
   resetTransform()
-  imgSrc.value = null
-
-  const fullPath = fullPathOf(photo)
-  if (!fullPath) return
-
-  let previewShown = false
-  try {
-    const previewPath: string = await invoke('ensure_preview_cache', {
-      photoPath: fullPath,
-      size: PREVIEW_SIZE,
-      profile: PREVIEW_PROFILE,
-      quality: PREVIEW_QUALITY,
-    })
-    if (seq !== loadSeq.value) return
-    const previewSrc = toTauriImageSrc(previewPath)
-    const previewReady = await preloadImage(previewSrc)
-    if (seq !== loadSeq.value) return
-    if (previewReady) {
-      imgSrc.value = previewSrc
-      previewShown = true
-    }
-  } catch {
-    // keep fallback path below
-  }
-
-  const originalSrc = toTauriImageSrc(fullPath)
-  const originalReady = await preloadImage(originalSrc)
-  if (seq !== loadSeq.value) return
-  if (originalReady) {
-    imgSrc.value = originalSrc
-    return
-  }
-
-  if (!previewShown) imgSrc.value = null
-}
-
-watch(currentIndex, (idx) => {
-  void loadImage()
-  prefetchNeighbors(idx)
+  connectViewer(path)
 }, { immediate: true })
+watch(scale, (nextScale) => {
+  const path = currentFullPath.value
+  if (!path || nextScale <= 1) return
+  sharedViewerImagePipeline.setZoom(path, nextScale)
+})
 
 function navigate(delta: number) {
   const next = currentIndex.value + delta
@@ -302,7 +283,15 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  loadSeq.value += 1
+  const fallbackPhoto = store.activeTab?.photos[store.activeTab.cullIndex ?? 0] ?? null
+  const fallbackPath = fallbackPhoto ? fullPathOf(fallbackPhoto) : null
+  if (fallbackPath) {
+    sharedViewerImagePipeline.focus({
+      activePath: fallbackPath,
+      orderedPaths: orderedPhotoPaths.value,
+    })
+  }
+  disconnectViewer()
 })
 </script>
 
@@ -405,6 +394,16 @@ onUnmounted(() => {
   object-fit: contain;
   transition: transform 0.05s;
   user-select: none;
+}
+.lb-transition {
+  position: absolute;
+  top: 18px;
+  left: 18px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.48);
+  color: #a8b6c9;
+  font-size: 12px;
 }
 .lb-missing, .lb-loading {
   color: #555;
