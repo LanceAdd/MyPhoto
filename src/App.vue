@@ -2,21 +2,24 @@
   <n-config-provider :theme="darkTheme" :theme-overrides="themeOverrides">
     <n-message-provider>
       <n-dialog-provider>
-        <AppLayout />
+        <AppLayout v-if="ready" />
+        <div v-else class="app-booting">正在初始化…</div>
       </n-dialog-provider>
     </n-message-provider>
   </n-config-provider>
 </template>
 
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { ref } from 'vue'
 import { NConfigProvider, NMessageProvider, NDialogProvider, darkTheme } from 'naive-ui'
 import AppLayout from './components/AppLayout.vue'
 import { useWorkspaceStore } from './stores/workspace'
 import { useKeybindingStore } from './stores/keybinding'
+import { bootstrapApp } from './utils/app-bootstrap'
 
 const workspaceStore = useWorkspaceStore()
 const keybindingStore = useKeybindingStore()
+const ready = ref(false)
 
 const themeOverrides = {
   common: {
@@ -28,9 +31,11 @@ const themeOverrides = {
   }
 }
 
-onMounted(async () => {
-  await keybindingStore.load()
-  await workspaceStore.setupListeners()
+void bootstrapApp(
+  () => keybindingStore.load(),
+  () => workspaceStore.setupListeners(),
+).finally(() => {
+  ready.value = true
 })
 </script>
 
@@ -45,5 +50,14 @@ html, body, #app {
   overflow: hidden;
   user-select: none;
 }
-</style>
 
+.app-booting {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #7f90ad;
+  font-size: 14px;
+}
+</style>

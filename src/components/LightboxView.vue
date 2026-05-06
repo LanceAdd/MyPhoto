@@ -29,9 +29,9 @@
           :style="imgTransformStyle"
           draggable="false"
         />
-        <div v-if="showTransitionOverlay" class="lb-transition">加载中</div>
-        <div v-else-if="currentPhoto?.is_missing" class="lb-missing">文件已丢失</div>
-        <div v-else class="lb-loading">
+        <div v-if="viewerDisplayState === 'transition'" class="lb-transition">加载中</div>
+        <div v-else-if="viewerDisplayState === 'missing'" class="lb-missing">文件已丢失</div>
+        <div v-else-if="viewerDisplayState === 'loading'" class="lb-loading">
           <div class="spin">⟳</div>
         </div>
       </div>
@@ -80,6 +80,7 @@ import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useWorkspaceStore, type Photo } from '../stores/workspace'
 import { sharedViewerImagePipeline } from '../utils/viewer-image-runtime'
 import type { ViewerImageSnapshot } from '../utils/viewer-image-pipeline'
+import { resolveViewerDisplayState } from '../utils/viewer-display-state'
 
 const props = defineProps<{ photo: Photo }>()
 const emit = defineEmits<{ close: [] }>()
@@ -192,6 +193,11 @@ const showTransitionOverlay = computed(() =>
   && displayedPhotoPath.value !== currentFullPath.value
   && !currentPhoto.value?.is_missing
 )
+const viewerDisplayState = computed(() => resolveViewerDisplayState({
+  hasDisplaySrc: !!imgSrc.value,
+  isMissing: !!currentPhoto.value?.is_missing,
+  showTransitionOverlay: showTransitionOverlay.value,
+}))
 
 function disconnectViewer() {
   stopViewerSubscription?.()

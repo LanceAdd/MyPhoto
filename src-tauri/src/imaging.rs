@@ -1,7 +1,7 @@
 use crate::db::with_db;
 use crate::models::ExportOptions;
 use chrono::Local;
-use image::{imageops::FilterType, DynamicImage};
+use image::{imageops::FilterType, DynamicImage, ImageDecoder, ImageReader};
 use rusqlite::params;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -55,6 +55,7 @@ const DEFAULT_PREVIEW_CACHE_MAX_SIZE_MB: u64 = 8 * 1024;
 const MIN_PREVIEW_CACHE_MAX_SIZE_MB: u64 = 512;
 const MAX_PREVIEW_CACHE_MAX_SIZE_MB: u64 = 64 * 1024;
 const CACHE_TRIM_WRITE_INTERVAL: usize = 8;
+const THUMB_CACHE_VERSION: &str = "exif-orientation-v1";
 
 fn preview_cache_trim_counter() -> &'static AtomicUsize {
     static COUNTER: OnceLock<AtomicUsize> = OnceLock::new();
@@ -556,6 +557,7 @@ fn build_cache_key_v2(
     quality: u8,
 ) -> String {
     let mut hasher = DefaultHasher::new();
+    THUMB_CACHE_VERSION.hash(&mut hasher);
     photo_path.hash(&mut hasher);
     size.hash(&mut hasher);
     file_len.hash(&mut hasher);
@@ -563,6 +565,17 @@ fn build_cache_key_v2(
     profile.hash(&mut hasher);
     quality.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+fn open_image_with_orientation(path: impl AsRef<Path>) -> Result<DynamicImage, String> {
+    let mut decoder = ImageReader::open(path.as_ref())
+        .map_err(|e| e.to_string())?
+        .into_decoder()
+        .map_err(|e| e.to_string())?;
+    let orientation = decoder.orientation().map_err(|e| e.to_string())?;
+    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    img.apply_orientation(orientation);
+    Ok(img)
 }
 
 fn generate_thumbnail_with_profile(
@@ -581,7 +594,7 @@ fn generate_thumbnail_with_profile(
     }
 
     let decode_started = Instant::now();
-    let img = image::open(photo_path).map_err(|e| e.to_string())?;
+    let img = open_image_with_orientation(photo_path)?;
     let decode_ms = decode_started.elapsed().as_millis();
 
     let resize_started = Instant::now();
@@ -661,7 +674,7 @@ fn ensure_warmup_cache_variants_for_photo(
     }
 
     let decode_started = Instant::now();
-    let img = image::open(photo_path).map_err(|e| e.to_string())?;
+    let img = open_image_with_orientation(photo_path)?;
     let decode_ms = decode_started.elapsed().as_millis();
     let mut decode_recorded = false;
 
@@ -878,7 +891,7 @@ pub fn export_photos(
         if options.format == "original" && options.max_dimension.is_none() {
             std::fs::copy(&src_path, &dest_file).map_err(|e| e.to_string())?;
         } else {
-            let img = image::open(&src_path).map_err(|e| e.to_string())?;
+            let img = open_image_with_orientation(&src_path)?;
             let img = apply_max_dimension(img, options.max_dimension);
             save_image(&img, &dest_file, &options.format, options.quality)?;
         }

@@ -39,11 +39,11 @@
             :style="previewTransformStyle"
             draggable="false"
           />
-          <div v-if="showTransitionOverlay" class="preview-transition">
+          <div v-if="viewerDisplayState === 'transition'" class="preview-transition">
             <div class="loading-spin">加载中</div>
           </div>
-          <div v-else-if="currentPhoto?.is_missing" class="preview-missing">文件已丢失</div>
-          <div v-else class="preview-loading">
+          <div v-else-if="viewerDisplayState === 'missing'" class="preview-missing">文件已丢失</div>
+          <div v-else-if="viewerDisplayState === 'loading'" class="preview-loading">
             <div class="loading-spin">加载中</div>
           </div>
         </div>
@@ -115,6 +115,7 @@ import { useWorkspaceStore } from '../stores/workspace'
 import RailThumb from './RailThumb.vue'
 import { sharedViewerImagePipeline } from '../utils/viewer-image-runtime'
 import type { ViewerImageSnapshot } from '../utils/viewer-image-pipeline'
+import { resolveViewerDisplayState } from '../utils/viewer-display-state'
 
 const store = useWorkspaceStore()
 const tab = computed(() => store.activeTab)
@@ -210,6 +211,11 @@ const showTransitionOverlay = computed(() =>
   && displayedPhotoPath.value !== currentFullPath.value
   && !currentPhoto.value?.is_missing
 )
+const viewerDisplayState = computed(() => resolveViewerDisplayState({
+  hasDisplaySrc: !!previewSrc.value,
+  isMissing: !!currentPhoto.value?.is_missing,
+  showTransitionOverlay: showTransitionOverlay.value,
+}))
 
 function disconnectViewer() {
   stopViewerSubscription?.()
